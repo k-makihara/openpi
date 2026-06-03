@@ -1091,6 +1091,10 @@ _CONFIGS = [
             downsample_step=3,
             history_steps=4,
             action_horizon_steps=16,
+            assets=AssetsConfig(
+                assets_dir="/home/makihara/ckpt",
+                asset_id="right",
+            ),
         ),
         batch_size=32,
         lr_schedule=_optimizer.CosineDecaySchedule(
@@ -1141,6 +1145,10 @@ _CONFIGS = [
             downsample_step=3,
             history_steps=4,
             action_horizon_steps=16,
+            assets=AssetsConfig(
+                assets_dir="/home/makihara/ckpt",
+                asset_id="assets",
+            ),
         ),
         batch_size=32,
         lr_schedule=_optimizer.CosineDecaySchedule(
