@@ -2,6 +2,7 @@ from collections.abc import Iterator, Sequence
 import logging
 import multiprocessing
 import os
+import pathlib
 import typing
 from typing import Literal, Protocol, SupportsIndex, TypeVar
 
@@ -57,6 +58,30 @@ class TransformedDataset(Dataset[T_co]):
 
     def __getitem__(self, index: SupportsIndex) -> T_co:
         return self._transform(self._dataset[index])
+
+    def __len__(self) -> int:
+        return len(self._dataset)
+
+
+class RetryOnErrorDataset(Dataset[T_co]):
+    """Retries neighboring indices when a sample is corrupted/unreadable."""
+
+    def __init__(self, dataset: Dataset[T_co], *, max_retries: int = 32):
+        self._dataset = dataset
+        self._max_retries = max_retries
+
+    def __getitem__(self, index: SupportsIndex) -> T_co:
+        base = index.__index__()
+        n = len(self._dataset)
+        for retry in range(self._max_retries):
+            idx = (base + retry) % n
+            try:
+                return self._dataset[idx]
+            except (AssertionError, RuntimeError, ValueError) as exc:
+                if retry == 0:
+                    logging.warning("Skipping unreadable sample at index %d: %s", idx, exc)
+                continue
+        raise RuntimeError(f"Failed to fetch a valid sample after {self._max_retries} retries from index {base}.")
 
     def __len__(self) -> int:
         return len(self._dataset)
@@ -127,6 +152,42 @@ class FakeDataset(Dataset):
         return self._num_samples
 
 
+_LEROBOT_STATS_PATCHED = False
+
+
+def _patch_lerobot_aggregate_stats() -> None:
+    """Patch LeRobot aggregate_stats to tolerate malformed episodes_stats in local datasets.
+
+    Some locally generated v2.1 datasets may contain per-episode image stats with shapes that
+    do not satisfy strict assertions in lerobot. In that case we fall back to empty stats,
+    which is sufficient for openpi because normalization stats are computed/loaded separately.
+    """
+    global _LEROBOT_STATS_PATCHED
+    if _LEROBOT_STATS_PATCHED:
+        return
+
+    original = lerobot_dataset.aggregate_stats
+    original_get_episode_paths = lerobot_dataset.LeRobotDataset.get_episodes_file_paths
+
+    def _safe_aggregate_stats(stats_list):
+        try:
+            return original(stats_list)
+        except ValueError as exc:
+            logging.warning("Falling back to empty lerobot metadata stats due to malformed episodes_stats: %s", exc)
+            return {}
+
+    lerobot_dataset.aggregate_stats = _safe_aggregate_stats
+
+    def _safe_get_episodes_file_paths(self):
+        # Keep only files that actually exist locally. This avoids forcing HF fallback
+        # when dataset metadata contains optional/missing video streams.
+        fpaths = original_get_episode_paths(self)
+        return [fp for fp in fpaths if (self.root / fp).is_file()]
+
+    lerobot_dataset.LeRobotDataset.get_episodes_file_paths = _safe_get_episodes_file_paths
+    _LEROBOT_STATS_PATCHED = True
+
+
 def create_torch_dataset(
     data_config: _config.DataConfig, action_horizon: int, model_config: _model.BaseModelConfig
 ) -> Dataset:
@@ -137,18 +198,52 @@ def create_torch_dataset(
     if repo_id == "fake":
         return FakeDataset(model_config, num_samples=1024)
 
-    dataset_meta = lerobot_dataset.LeRobotDatasetMetadata(repo_id)
+    _patch_lerobot_aggregate_stats()
+    dataset_kwargs = {}
+    local_repo_id = repo_id
+    if repo_id is not None and (repo_id.startswith("/") or pathlib.Path(repo_id).exists()):
+        repo_path = pathlib.Path(repo_id).expanduser().resolve()
+        # Fail fast for broken local datasets where parquet shards exist but are empty.
+        data_dir = repo_path / "data"
+        if data_dir.is_dir():
+            parquet_files = list(data_dir.rglob("*.parquet"))
+            if parquet_files and not any(p.stat().st_size > 0 for p in parquet_files):
+                raise ValueError(
+                    f"Local LeRobot dataset appears corrupted: all {len(parquet_files)} parquet files are 0 bytes under "
+                    f"'{data_dir}'. Re-download/regenerate the dataset and retry."
+                )
+        local_repo_id = repo_path.name
+        dataset_kwargs["root"] = str(repo_path)
+
+    dataset_meta = lerobot_dataset.LeRobotDatasetMetadata(local_repo_id, **dataset_kwargs)
+    stride = max(1, int(data_config.action_sample_stride))
+    delta_timestamps = data_config.delta_timestamps_overrides
+    if delta_timestamps is None:
+        delta_timestamps = {
+            key: [(t * stride) / dataset_meta.fps for t in range(action_horizon)] for key in data_config.action_sequence_keys
+        }
     dataset = lerobot_dataset.LeRobotDataset(
-        data_config.repo_id,
-        delta_timestamps={
-            key: [t / dataset_meta.fps for t in range(action_horizon)] for key in data_config.action_sequence_keys
-        },
+        local_repo_id,
+        delta_timestamps=delta_timestamps,
+        tolerance_s=float(data_config.lerobot_tolerance_s),
+        video_backend=data_config.lerobot_video_backend,
+        **dataset_kwargs,
     )
+
+    # Some local datasets include video features in metadata without corresponding files.
+    # Disable such streams so __getitem__ does not attempt to decode missing videos.
+    for key, ft in dataset.meta.features.items():
+        if ft.get("dtype") != "video":
+            continue
+        any_found = any((dataset.root / dataset.meta.get_video_file_path(ep, key)).is_file() for ep in dataset.meta.episodes)
+        if not any_found:
+            logging.warning("Disabling missing video stream '%s' from dataset metadata.", key)
+            ft["dtype"] = "unsupported"
 
     if data_config.prompt_from_task:
         dataset = TransformedDataset(dataset, [_transforms.PromptFromLeRobotTask(dataset_meta.tasks)])
 
-    return dataset
+    return RetryOnErrorDataset(dataset)
 
 
 def create_rlds_dataset(

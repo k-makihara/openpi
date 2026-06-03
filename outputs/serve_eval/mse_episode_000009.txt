@@ -1,0 +1,10 @@
+dataset_dir: /groups/gag51454/workspace_makihara/dataset/lerobot_v21_ph2_success_handover
+episode: 9
+host: 127.0.0.1
+port: 8000
+history_steps: 4
+horizon_steps: 16
+num_eval_points: 1024
+final_mse: 3.6655552387
+plot: outputs/serve_eval/mse_episode_000009.png
+dim_plot: outputs/serve_eval/pred_vs_gt_dims_episode_000009.png
