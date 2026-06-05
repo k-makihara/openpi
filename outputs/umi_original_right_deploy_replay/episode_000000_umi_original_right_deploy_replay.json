@@ -1,0 +1,18 @@
+{
+  "dataset_dir": "/home/makihara/genoma_data/rosbags/lerobot_v21_ph2_success",
+  "episode": 0,
+  "host": "127.0.0.1",
+  "port": 8001,
+  "prompt": "pick the object and place it in the box",
+  "history_steps": 4,
+  "downsample_step": 3,
+  "rows": 286,
+  "mean_pos_err_mm": 3.4025238705353735,
+  "mean_rot_err_deg": 8.364028957211975e-16,
+  "server_metadata": {},
+  "artifacts": {
+    "csv": "/home/makihara/openpi/outputs/umi_original_right_deploy_replay/episode_000000_umi_original_right_deploy_replay.csv",
+    "npz": "/home/makihara/openpi/outputs/umi_original_right_deploy_replay/episode_000000_umi_original_right_deploy_replay.npz",
+    "png": "/home/makihara/openpi/outputs/umi_original_right_deploy_replay/episode_000000_umi_original_right_deploy_replay.png"
+  }
+}

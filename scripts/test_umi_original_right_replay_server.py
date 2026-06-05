@@ -26,6 +26,17 @@ ACTION_DIM_NAMES = [
 ]
 
 
+def _history_indices(t: int, history_steps: int, downsample_step: int) -> np.ndarray:
+    return np.asarray(
+        [t - downsample_step * (history_steps - 1 - i) for i in range(history_steps)],
+        dtype=np.int32,
+    )
+
+
+def _future_indices(t: int, horizon_steps: int, downsample_step: int) -> np.ndarray:
+    return np.asarray([t + downsample_step * i for i in range(horizon_steps)], dtype=np.int32)
+
+
 def _read_episode_table(dataset_dir: pathlib.Path, episode_idx: int):
     episode_path = dataset_dir / "data" / "chunk-000" / f"episode_{episode_idx:06d}.parquet"
     if not episode_path.exists():
@@ -119,10 +130,12 @@ def _save_matplotlib_plot(
     rows = int(np.ceil(dim / cols))
     fig, axes = plt.subplots(rows, cols, figsize=(7 * cols, 2.6 * rows), sharex=True)
     axes = np.asarray(axes).reshape(-1)
+    diff_first = pred_first - gt_first
     for d in range(dim):
         ax = axes[d]
         ax.plot(step_ids, gt_first[:, d], label="gt", linewidth=1.3)
         ax.plot(step_ids, pred_first[:, d], label="pred", linewidth=1.1)
+        ax.plot(step_ids, diff_first[:, d], label="pred-gt", linewidth=0.9, alpha=0.8)
         ax.set_title(ACTION_DIM_NAMES[d])
         ax.grid(True, alpha=0.25)
     for d in range(dim, len(axes)):
@@ -149,6 +162,7 @@ def _save_plotly_plot(
         return False
 
     dim = pred_first.shape[1]
+    diff_first = pred_first - gt_first
     rows = dim
     fig = make_subplots(rows=rows, cols=1, shared_xaxes=True, subplot_titles=ACTION_DIM_NAMES)
     for d in range(dim):
@@ -159,6 +173,16 @@ def _save_plotly_plot(
         )
         fig.add_trace(
             go.Scatter(x=step_ids, y=pred_first[:, d], name=f"{ACTION_DIM_NAMES[d]} pred", mode="lines"),
+            row=d + 1,
+            col=1,
+        )
+        fig.add_trace(
+            go.Scatter(
+                x=step_ids,
+                y=diff_first[:, d],
+                name=f"{ACTION_DIM_NAMES[d]} pred-gt",
+                mode="lines",
+            ),
             row=d + 1,
             col=1,
         )
@@ -187,12 +211,18 @@ def main() -> None:
     parser.add_argument("--port", type=int, default=8001)
     parser.add_argument("--history-steps", type=int, default=4)
     parser.add_argument("--horizon-steps", type=int, default=10)
+    parser.add_argument("--downsample-step", type=int, default=3)
     parser.add_argument("--prompt", type=str, default="handover object")
-    parser.add_argument("--start-step", type=int, default=-1, help="Default = history_steps - 1")
+    parser.add_argument(
+        "--start-step",
+        type=int,
+        default=-1,
+        help="Default = (history_steps - 1) * downsample_step",
+    )
     parser.add_argument("--end-step", type=int, default=-1, help="Inclusive end; default auto.")
     parser.add_argument("--stride", type=int, default=1)
     parser.add_argument("--max-steps", type=int, default=0, help="0 means no limit.")
-    parser.add_argument("--resize", type=int, default=224, help="0 disables resize.")
+    parser.add_argument("--resize", type=int, default=0, help="0 disables resize.")
     parser.add_argument("--out-dir", type=pathlib.Path, default=pathlib.Path("./outputs/umi_original_right_server"))
     args = parser.parse_args()
 
@@ -205,10 +235,16 @@ def main() -> None:
     num_steps = right_pose.shape[0]
     hist = int(args.history_steps)
     requested_horizon = int(args.horizon_steps)
-    start_t = hist - 1 if args.start_step < 0 else int(args.start_step)
-    end_t = (num_steps - requested_horizon - 1) if args.end_step < 0 else int(args.end_step)
+    downsample_step = max(1, int(args.downsample_step))
+    hist_span = (hist - 1) * downsample_step
+    future_span = (requested_horizon - 1) * downsample_step
+    start_t = hist_span if args.start_step < 0 else int(args.start_step)
+    end_t = (num_steps - 1 - future_span) if args.end_step < 0 else int(args.end_step)
     if end_t < start_t:
-        raise ValueError(f"Invalid step range: start={start_t}, end={end_t}, num_steps={num_steps}")
+        raise ValueError(
+            f"Invalid step range: start={start_t}, end={end_t}, num_steps={num_steps}, "
+            f"history_steps={hist}, downsample_step={downsample_step}, horizon_steps={requested_horizon}"
+        )
 
     resize_hw = None if args.resize <= 0 else (int(args.resize), int(args.resize))
     left_reader = SequentialVideoReader(
@@ -232,19 +268,21 @@ def main() -> None:
     gt_chunks: list[np.ndarray] = []
     pred_abs_pose_first: list[np.ndarray] = []
     pred_abs_gripper_first: list[float] = []
+    obs_pose_histories: list[np.ndarray] = []
+    obs_gripper_histories: list[np.ndarray] = []
+    model_states: list[np.ndarray] = []
 
     try:
         for t in range(start_t, end_t + 1, max(1, int(args.stride))):
             if args.max_steps > 0 and len(step_ids) >= args.max_steps:
                 break
 
-            i0 = t - hist + 1
-            i1 = t + 1
+            hist_idx = _history_indices(t, hist, downsample_step)
             obs = {
                 "left_image": left_reader.get_frame(t),
                 "right_image": right_reader.get_frame(t),
-                "pose_seq": right_pose[i0:i1],
-                "gripper_seq": right_gripper[i0:i1],
+                "pose_seq": right_pose[hist_idx],
+                "gripper_seq": right_gripper[hist_idx],
                 "prompt": args.prompt,
             }
             pred = client.infer(obs)
@@ -261,17 +299,20 @@ def main() -> None:
                     history_steps=hist,
                     action_horizon_steps=horizon,
                 )
-            if (t + horizon) > num_steps:
+            model_inputs = to_model_space_cache[horizon](obs)
+            fut_idx = _future_indices(t, horizon, downsample_step)
+            if int(fut_idx[-1]) >= num_steps:
                 print(
-                    f"[INFO] stopping at t={t} because dataset tail is shorter than server horizon={horizon}",
+                    f"[INFO] stopping at t={t} because dataset tail is shorter than "
+                    f"server horizon={horizon} with downsample_step={downsample_step}",
                     flush=True,
                 )
                 break
 
             gt_obs = {
                 **obs,
-                "action_pose_seq": right_action_pose[t : t + horizon],
-                "action_gripper_seq": right_action_gripper[t : t + horizon],
+                "action_pose_seq": right_action_pose[fut_idx],
+                "action_gripper_seq": right_action_gripper[fut_idx],
             }
             gt_actions = np.asarray(to_model_space_cache[horizon](gt_obs)["actions"], dtype=np.float32)
             if pred_actions.shape != gt_actions.shape:
@@ -282,6 +323,9 @@ def main() -> None:
             gt_first_list.append(gt_actions[0].copy())
             pred_chunks.append(pred_actions.copy())
             gt_chunks.append(gt_actions.copy())
+            obs_pose_histories.append(np.asarray(obs["pose_seq"], dtype=np.float32).copy())
+            obs_gripper_histories.append(np.asarray(obs["gripper_seq"], dtype=np.float32).copy())
+            model_states.append(np.asarray(model_inputs["state"], dtype=np.float32).copy())
 
             right_arm = pred.get("right_arm", {})
             pred_abs_pose = np.asarray(right_arm.get("pose", np.zeros((horizon, 7), dtype=np.float32)), dtype=np.float32)
@@ -303,6 +347,10 @@ def main() -> None:
     gt_chunks_np = np.stack(gt_chunks, axis=0)
     pred_abs_pose_first_np = np.stack(pred_abs_pose_first, axis=0)
     pred_abs_gripper_first_np = np.asarray(pred_abs_gripper_first, dtype=np.float32)
+    obs_pose_histories_np = np.stack(obs_pose_histories, axis=0)
+    obs_gripper_histories_np = np.stack(obs_gripper_histories, axis=0)
+    model_states_np = np.stack(model_states, axis=0)
+    diff_first = pred_first - gt_first
 
     out_dir = args.out_dir.expanduser().resolve()
     out_dir.mkdir(parents=True, exist_ok=True)
@@ -321,6 +369,10 @@ def main() -> None:
         gt_chunks=gt_chunks_np,
         pred_abs_pose_first=pred_abs_pose_first_np,
         pred_abs_gripper_first=pred_abs_gripper_first_np,
+        pred_minus_gt_first=diff_first,
+        obs_pose_histories=obs_pose_histories_np,
+        obs_gripper_histories=obs_gripper_histories_np,
+        model_states=model_states_np,
     )
 
     plotly_ok = _save_plotly_plot(step_ids=step_ids_np, pred_first=pred_first, gt_first=gt_first, out_path=html_path)
@@ -328,17 +380,31 @@ def main() -> None:
 
     mse_all = float(np.mean((pred_chunks_np - gt_chunks_np) ** 2))
     mae_first = np.mean(np.abs(pred_first - gt_first), axis=0)
+    bias_first = np.mean(diff_first, axis=0)
+    rmse_first = np.sqrt(np.mean(diff_first ** 2, axis=0))
+    corr_first = {}
+    for i, name in enumerate(ACTION_DIM_NAMES):
+        gt_i = gt_first[:, i]
+        pred_i = pred_first[:, i]
+        if float(np.std(gt_i)) < 1e-9 or float(np.std(pred_i)) < 1e-9:
+            corr_first[name] = None
+        else:
+            corr_first[name] = float(np.corrcoef(gt_i, pred_i)[0, 1])
     summary = {
         "dataset_dir": str(args.dataset_dir),
         "episode": int(args.episode),
         "host": args.host,
         "port": int(args.port),
         "history_steps": hist,
+        "downsample_step": downsample_step,
         "requested_horizon_steps": requested_horizon,
         "inferred_server_horizon_steps": inferred_horizon,
         "num_queries": int(len(step_ids)),
         "mse_all": mse_all,
         "mae_first_by_dim": {name: float(mae_first[i]) for i, name in enumerate(ACTION_DIM_NAMES)},
+        "rmse_first_by_dim": {name: float(rmse_first[i]) for i, name in enumerate(ACTION_DIM_NAMES)},
+        "bias_first_by_dim": {name: float(bias_first[i]) for i, name in enumerate(ACTION_DIM_NAMES)},
+        "corr_first_by_dim": corr_first,
         "server_metadata": server_metadata,
         "artifacts": {
             "npz": str(npz_path),

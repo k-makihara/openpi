@@ -134,6 +134,30 @@ def _pose9_to_transform(pose9: np.ndarray) -> np.ndarray:
     return tf
 
 
+def _apply_dataset_relative_pose9(current_pose7: np.ndarray, rel_pose9: np.ndarray) -> np.ndarray:
+    """
+    Apply a UMI-original relative action using the same semantics as dataset generation.
+
+    Dataset conversion uses:
+      - xyz = current_xyz - previous_xyz            (world/base-frame translation delta)
+      - q_rel = q_prev^-1 * q_current               (relative rotation)
+
+    So reconstruction must do:
+      - p_next = p_prev + xyz_world
+      - R_next = R_prev @ R_rel
+    """
+    current_pose7 = np.asarray(current_pose7, dtype=np.float32).reshape(7)
+    rel_pose9 = np.asarray(rel_pose9, dtype=np.float32).reshape(9)
+
+    current_tf = _pose7_to_transform(current_pose7)
+    rel_rot = _rot6d_to_rotmat(rel_pose9[3:9])
+
+    next_tf = np.eye(4, dtype=np.float32)
+    next_tf[:3, 3] = current_tf[:3, 3] + rel_pose9[:3]
+    next_tf[:3, :3] = current_tf[:3, :3] @ rel_rot
+    return _transform_to_pose7(next_tf)
+
+
 class UmiAbsoluteIOPolicy(_policy.BasePolicy):
     """Wrapper policy for UMI handover that accepts absolute state sequences and returns absolute arm-wise outputs."""
 
@@ -209,13 +233,11 @@ class UmiOriginalRightIOPolicy(_policy.BasePolicy):
         current_pose = right_pose_seq[-1]
         current_gripper = _umi_original_policy._forward_fill_zeros(right_gripper_seq)[-1]
 
-        current_tf = _pose7_to_transform(current_pose)
         abs_pose_seq = []
         abs_gripper_seq = []
         for action in actions:
-            delta_tf = _pose9_to_transform(action[:9])
-            current_tf = current_tf @ delta_tf
-            abs_pose_seq.append(_transform_to_pose7(current_tf))
+            current_pose = _apply_dataset_relative_pose9(current_pose, action[:9])
+            abs_pose_seq.append(current_pose.copy())
             current_gripper = float(action[9])
             abs_gripper_seq.append(current_gripper)
 
