@@ -20,7 +20,6 @@ import openpi.models.tokenizer as _tokenizer
 import openpi.policies.aloha_policy as aloha_policy
 import openpi.policies.droid_policy as droid_policy
 import openpi.policies.libero_policy as libero_policy
-import openpi.policies.umi_handover_policy as umi_handover_policy
 import openpi.policies.umi_original_policy as umi_original_policy
 import openpi.shared.download as _download
 import openpi.shared.normalize as _normalize
@@ -191,7 +190,7 @@ class DataConfigFactory(abc.ABC):
 
     def create_base_config(self, assets_dirs: pathlib.Path, model_config: _model.BaseModelConfig) -> DataConfig:
         repo_id = self.repo_id if self.repo_id is not tyro.MISSING else None
-        asset_id = self.assets.asset_id or repo_id
+        asset_id = self.assets.asset_id or _default_asset_id(repo_id)
         return dataclasses.replace(
             self.base_config or DataConfig(),
             repo_id=repo_id,
@@ -211,6 +210,15 @@ class DataConfigFactory(abc.ABC):
         except FileNotFoundError:
             logging.info(f"Norm stats not found in {data_assets_dir}, skipping.")
         return None
+
+
+def _default_asset_id(repo_id: str | None) -> str | None:
+    if repo_id is None:
+        return None
+    repo_path = pathlib.Path(repo_id)
+    if repo_id.startswith("/") or repo_id.startswith(".") or repo_path.exists():
+        return repo_path.expanduser().resolve().name
+    return repo_id.replace("/", "__")
 
 
 @dataclasses.dataclass(frozen=True)
@@ -369,78 +377,14 @@ class LeRobotLiberoDataConfig(DataConfigFactory):
 
 
 @dataclasses.dataclass(frozen=True)
-class LeRobotUmiHandoverDataConfig(DataConfigFactory):
-    # If provided, this prompt will be injected if missing in the dataset.
-    default_prompt: str | None = "handover object"
-    # Use N=3 for 60Hz -> 20Hz sampling.
-    action_sample_stride: int = 3
-    # Number of past steps (including current t) for state history at 20Hz.
-    history_steps: int = 4
-    # Number of future steps for action horizon at 20Hz.
-    action_horizon_steps: int = 10
-
-    repack_transforms: tyro.conf.Suppress[_transforms.Group] = dataclasses.field(
-        default=_transforms.Group(
-            inputs=[
-                _transforms.RepackTransform(
-                    {
-                        "left_image": "observation.image.left",
-                        "right_image": "observation.image.right",
-                        "left_pose_seq": "observation.pose.left_left_finger_tip.absolute",
-                        "right_pose_seq": "observation.pose.right_right_finger_tip.absolute",
-                        "left_gripper_seq": "observation.state.left_gripper",
-                        "right_gripper_seq": "observation.state.right_gripper",
-                        "prompt": "task",
-                    }
-                )
-            ]
-        )
-    )
-    action_sequence_keys: Sequence[str] = (
-        "action.left_controller.relative",
-        "action.right_controller.relative",
-        "action.left_gripper.relative",
-        "action.right_gripper.relative",
-    )
-
-    @override
-    def create(self, assets_dirs: pathlib.Path, model_config: _model.BaseModelConfig) -> DataConfig:
-        step_sec = float(self.action_sample_stride) / 60.0
-        hist = [-(self.history_steps - 1 - i) * step_sec for i in range(self.history_steps)]
-        fut = [(i + 1) * step_sec for i in range(self.action_horizon_steps)]
-        seq_timestamps = hist + fut
-        return dataclasses.replace(
-            self.create_base_config(assets_dirs, model_config),
-            repack_transforms=self.repack_transforms,
-            data_transforms=_transforms.Group(
-                inputs=[
-                    umi_handover_policy.UmiHandoverInputs(
-                        history_steps=self.history_steps,
-                        action_horizon_steps=self.action_horizon_steps,
-                    )
-                ],
-                outputs=[umi_handover_policy.UmiHandoverOutputs()],
-            ),
-            model_transforms=ModelTransformFactory(default_prompt=self.default_prompt)(model_config),
-            action_sequence_keys=self.action_sequence_keys,
-            action_sample_stride=self.action_sample_stride,
-            delta_timestamps_overrides={
-                "observation.pose.left_left_finger_tip.absolute": seq_timestamps,
-                "observation.pose.right_right_finger_tip.absolute": seq_timestamps,
-                "observation.state.left_gripper": seq_timestamps,
-                "observation.state.right_gripper": seq_timestamps,
-            },
-        )
-
-
-@dataclasses.dataclass(frozen=True)
 class LeRobotUmiOriginalDataConfig(DataConfigFactory):
     """Single-arm UMI config based on controller pose + absolute gripper."""
 
-    default_prompt: str | None = "handover object"
+    default_prompt: str | None = "pick the object and place it in the box"
     downsample_step: int = 3
     history_steps: int = 4
     action_horizon_steps: int = 10
+    action_pose_target: str = "delta"
 
     repack_transforms: tyro.conf.Suppress[_transforms.Group] = dataclasses.field(
         default=_transforms.Group(
@@ -468,6 +412,7 @@ class LeRobotUmiOriginalDataConfig(DataConfigFactory):
     def create(self, assets_dirs: pathlib.Path, model_config: _model.BaseModelConfig) -> DataConfig:
         step_sec = float(self.downsample_step) / 60.0
         hist = [-(self.history_steps - 1 - i) * step_sec for i in range(self.history_steps)]
+        fut_abs = [i * step_sec for i in range(self.action_horizon_steps)]
         fut = [(i * step_sec) for i in range(self.action_horizon_steps)]
         return dataclasses.replace(
             self.create_base_config(assets_dirs, model_config),
@@ -477,6 +422,7 @@ class LeRobotUmiOriginalDataConfig(DataConfigFactory):
                     umi_original_policy.UmiOriginalInputs(
                         history_steps=self.history_steps,
                         action_horizon_steps=self.action_horizon_steps,
+                        action_pose_target=self.action_pose_target,
                     )
                 ],
                 outputs=[umi_original_policy.UmiOriginalOutputs()],
@@ -485,8 +431,133 @@ class LeRobotUmiOriginalDataConfig(DataConfigFactory):
             action_sequence_keys=self.action_sequence_keys,
             action_sample_stride=self.downsample_step,
             delta_timestamps_overrides={
-                "observation.pose.right_controller.absolute": hist,
-                "observation.state.right_gripper": hist,
+                "observation.pose.right_controller.absolute": hist + fut_abs,
+                "observation.state.right_gripper": hist + fut_abs,
+                "action.right_controller.relative": fut,
+                "action.right_gripper.absolute": fut,
+            },
+        )
+
+
+@dataclasses.dataclass(frozen=True)
+class LeRobotUmiOriginalRightThirdSlotDataConfig(DataConfigFactory):
+    """Single-arm UMI config that places the right camera only in the third model image slot."""
+
+    default_prompt: str | None = "pick the object and place it in the box"
+    downsample_step: int = 3
+    history_steps: int = 4
+    action_horizon_steps: int = 10
+    action_pose_target: str = "delta"
+
+    repack_transforms: tyro.conf.Suppress[_transforms.Group] = dataclasses.field(
+        default=_transforms.Group(
+            inputs=[
+                _transforms.RepackTransform(
+                    {
+                        "right_image": "observation.image.right",
+                        "pose_seq": "observation.pose.right_controller.absolute",
+                        "gripper_seq": "observation.state.right_gripper",
+                        "action_pose_seq": "action.right_controller.relative",
+                        "action_gripper_seq": "action.right_gripper.absolute",
+                        "prompt": "task",
+                    }
+                )
+            ]
+        )
+    )
+    action_sequence_keys: Sequence[str] = (
+        "action.right_controller.relative",
+        "action.right_gripper.absolute",
+    )
+
+    @override
+    def create(self, assets_dirs: pathlib.Path, model_config: _model.BaseModelConfig) -> DataConfig:
+        step_sec = float(self.downsample_step) / 60.0
+        hist = [-(self.history_steps - 1 - i) * step_sec for i in range(self.history_steps)]
+        fut_abs = [i * step_sec for i in range(self.action_horizon_steps)]
+        fut = [i * step_sec for i in range(self.action_horizon_steps)]
+        return dataclasses.replace(
+            self.create_base_config(assets_dirs, model_config),
+            repack_transforms=self.repack_transforms,
+            data_transforms=_transforms.Group(
+                inputs=[
+                    umi_original_policy.UmiOriginalRightThirdSlotInputs(
+                        history_steps=self.history_steps,
+                        action_horizon_steps=self.action_horizon_steps,
+                        action_pose_target=self.action_pose_target,
+                    )
+                ],
+                outputs=[umi_original_policy.UmiOriginalOutputs()],
+            ),
+            model_transforms=ModelTransformFactory(default_prompt=self.default_prompt)(model_config),
+            action_sequence_keys=self.action_sequence_keys,
+            action_sample_stride=self.downsample_step,
+            delta_timestamps_overrides={
+                "observation.pose.right_controller.absolute": hist + fut_abs,
+                "observation.state.right_gripper": hist + fut_abs,
+                "action.right_controller.relative": fut,
+                "action.right_gripper.absolute": fut,
+            },
+        )
+
+
+@dataclasses.dataclass(frozen=True)
+class LeRobotUmiOriginalRightPrevCurrentThirdSlotDataConfig(DataConfigFactory):
+    """Single-arm UMI config with previous right image in slot 2 and current right image in slot 3."""
+
+    default_prompt: str | None = "pick the object and place it in the box"
+    downsample_step: int = 3
+    history_steps: int = 4
+    action_horizon_steps: int = 10
+    action_pose_target: str = "delta"
+
+    repack_transforms: tyro.conf.Suppress[_transforms.Group] = dataclasses.field(
+        default=_transforms.Group(
+            inputs=[
+                _transforms.RepackTransform(
+                    {
+                        "right_image": "observation.image.right",
+                        "pose_seq": "observation.pose.right_controller.absolute",
+                        "gripper_seq": "observation.state.right_gripper",
+                        "action_pose_seq": "action.right_controller.relative",
+                        "action_gripper_seq": "action.right_gripper.absolute",
+                        "prompt": "task",
+                    }
+                )
+            ]
+        )
+    )
+    action_sequence_keys: Sequence[str] = (
+        "action.right_controller.relative",
+        "action.right_gripper.absolute",
+    )
+
+    @override
+    def create(self, assets_dirs: pathlib.Path, model_config: _model.BaseModelConfig) -> DataConfig:
+        step_sec = float(self.downsample_step) / 60.0
+        hist = [-(self.history_steps - 1 - i) * step_sec for i in range(self.history_steps)]
+        fut_abs = [i * step_sec for i in range(self.action_horizon_steps)]
+        fut = [i * step_sec for i in range(self.action_horizon_steps)]
+        return dataclasses.replace(
+            self.create_base_config(assets_dirs, model_config),
+            repack_transforms=self.repack_transforms,
+            data_transforms=_transforms.Group(
+                inputs=[
+                    umi_original_policy.UmiOriginalRightPrevAndCurrentThirdSlotInputs(
+                        history_steps=self.history_steps,
+                        action_horizon_steps=self.action_horizon_steps,
+                        action_pose_target=self.action_pose_target,
+                    )
+                ],
+                outputs=[umi_original_policy.UmiOriginalOutputs()],
+            ),
+            model_transforms=ModelTransformFactory(default_prompt=self.default_prompt)(model_config),
+            action_sequence_keys=self.action_sequence_keys,
+            action_sample_stride=self.downsample_step,
+            delta_timestamps_overrides={
+                "observation.image.right": [-step_sec, 0.0],
+                "observation.pose.right_controller.absolute": hist + fut_abs,
+                "observation.state.right_gripper": hist + fut_abs,
                 "action.right_controller.relative": fut,
                 "action.right_gripper.absolute": fut,
             },
@@ -501,6 +572,7 @@ class LeRobotUmiOriginalBimanualDataConfig(DataConfigFactory):
     downsample_step: int = 3
     history_steps: int = 4
     action_horizon_steps: int = 10
+    action_pose_target: str = "delta"
 
     repack_transforms: tyro.conf.Suppress[_transforms.Group] = dataclasses.field(
         default=_transforms.Group(
@@ -534,6 +606,7 @@ class LeRobotUmiOriginalBimanualDataConfig(DataConfigFactory):
     def create(self, assets_dirs: pathlib.Path, model_config: _model.BaseModelConfig) -> DataConfig:
         step_sec = float(self.downsample_step) / 60.0
         hist = [-(self.history_steps - 1 - i) * step_sec for i in range(self.history_steps)]
+        fut_abs = [i * step_sec for i in range(self.action_horizon_steps)]
         fut = [i * step_sec for i in range(self.action_horizon_steps)]
         return dataclasses.replace(
             self.create_base_config(assets_dirs, model_config),
@@ -543,6 +616,7 @@ class LeRobotUmiOriginalBimanualDataConfig(DataConfigFactory):
                     umi_original_policy.UmiOriginalBimanualInputs(
                         history_steps=self.history_steps,
                         action_horizon_steps=self.action_horizon_steps,
+                        action_pose_target=self.action_pose_target,
                     )
                 ],
                 outputs=[umi_original_policy.UmiOriginalBimanualOutputs()],
@@ -551,10 +625,10 @@ class LeRobotUmiOriginalBimanualDataConfig(DataConfigFactory):
             action_sequence_keys=self.action_sequence_keys,
             action_sample_stride=self.downsample_step,
             delta_timestamps_overrides={
-                "observation.pose.left_controller.absolute": hist,
-                "observation.pose.right_controller.absolute": hist,
-                "observation.state.left_gripper": hist,
-                "observation.state.right_gripper": hist,
+                "observation.pose.left_controller.absolute": hist + fut_abs,
+                "observation.pose.right_controller.absolute": hist + fut_abs,
+                "observation.state.left_gripper": hist + fut_abs,
+                "observation.state.right_gripper": hist + fut_abs,
                 "action.left_controller.relative": fut,
                 "action.right_controller.relative": fut,
                 "action.left_gripper.absolute": fut,
@@ -970,123 +1044,57 @@ _CONFIGS = [
         num_train_steps=30_000,
     ),
     TrainConfig(
-        name="pi05_umi_handover_20hz",
-        # state dim is 20 (= [left xyz+rot6d+gripper] + [right xyz+rot6d+gripper])
-        # action dim is 20 (= [left xyz+rot6d] + [right xyz+rot6d] + [left/right gripper absolute])
-        model=pi0_config.Pi0Config(pi05=True, action_horizon=10, action_dim=20, discrete_state_input=False),
-        data=LeRobotUmiHandoverDataConfig(
-            repo_id="/groups/gag51454/workspace_makihara/dataset/lerobot_v21_ph2_success_handover",
-            base_config=DataConfig(prompt_from_task=True, lerobot_tolerance_s=0.05),
-            action_sample_stride=3,  # 60Hz -> 20Hz
-        ),
-        batch_size=128,
-        lr_schedule=_optimizer.CosineDecaySchedule(
-            warmup_steps=10_000,
-            peak_lr=5e-5,
-            decay_steps=1_000_000,
-            decay_lr=5e-5,
-        ),
-        optimizer=_optimizer.AdamW(clip_gradient_norm=1.0),
-        ema_decay=0.999,
-        weight_loader=weight_loaders.CheckpointWeightLoader("gs://openpi-assets/checkpoints/pi05_base/params"),
-        pytorch_weight_path="/path/to/your/pytorch_weight_path",
-        num_train_steps=30_000,
-    ),
-    TrainConfig(
-        name="pi05_umi_left_sps_20hz",
-        model=pi0_config.Pi0Config(pi05=True, action_horizon=10, action_dim=20, discrete_state_input=False),
-        data=LeRobotUmiHandoverDataConfig(
-            repo_id="/groups/gag51454/workspace_makihara/dataset/lerobot_v21_ph2_success_left_sps",
-            base_config=DataConfig(prompt_from_task=True, lerobot_tolerance_s=0.05),
-            action_sample_stride=3,
-        ),
-        batch_size=128,
-        lr_schedule=_optimizer.CosineDecaySchedule(
-            warmup_steps=10_000,
-            peak_lr=5e-5,
-            decay_steps=1_000_000,
-            decay_lr=5e-5,
-        ),
-        optimizer=_optimizer.AdamW(clip_gradient_norm=1.0),
-        ema_decay=0.999,
-        weight_loader=weight_loaders.CheckpointWeightLoader("gs://openpi-assets/checkpoints/pi05_base/params"),
-        pytorch_weight_path="/path/to/your/pytorch_weight_path",
-        num_train_steps=30_000,
-    ),
-    TrainConfig(
-        name="pi05_umi_tape_20hz",
-        model=pi0_config.Pi0Config(pi05=True, action_horizon=10, action_dim=20, discrete_state_input=False),
-        data=LeRobotUmiHandoverDataConfig(
-            repo_id="/groups/gag51454/workspace_makihara/dataset/lerobot_v21_ph2_success_tape",
-            base_config=DataConfig(prompt_from_task=True, lerobot_tolerance_s=0.05),
-            action_sample_stride=3,
-        ),
-        batch_size=128,
-        lr_schedule=_optimizer.CosineDecaySchedule(
-            warmup_steps=10_000,
-            peak_lr=5e-5,
-            decay_steps=1_000_000,
-            decay_lr=5e-5,
-        ),
-        optimizer=_optimizer.AdamW(clip_gradient_norm=1.0),
-        ema_decay=0.999,
-        weight_loader=weight_loaders.CheckpointWeightLoader("gs://openpi-assets/checkpoints/pi05_base/params"),
-        pytorch_weight_path="/path/to/your/pytorch_weight_path",
-        num_train_steps=30_000,
-    ),
-    TrainConfig(
-        name="pi05_umi_handover_20hz_h16_bs32_30k",
-        model=pi0_config.Pi0Config(pi05=True, action_horizon=16, action_dim=32, discrete_state_input=False),
-        data=LeRobotUmiHandoverDataConfig(
-            repo_id="/groups/gag51454/workspace_makihara/dataset/lerobot_v21_ph2_success_handover",
-            base_config=DataConfig(prompt_from_task=True, lerobot_tolerance_s=0.05),
-            action_sample_stride=3,
-            action_horizon_steps=16,
-        ),
-        batch_size=32,
-        lr_schedule=_optimizer.CosineDecaySchedule(
-            warmup_steps=10_000,
-            peak_lr=5e-5,
-            decay_steps=1_000_000,
-            decay_lr=5e-5,
-        ),
-        optimizer=_optimizer.AdamW(clip_gradient_norm=1.0),
-        ema_decay=0.999,
-        weight_loader=weight_loaders.CheckpointWeightLoader("gs://openpi-assets/checkpoints/pi05_base/params"),
-        pytorch_weight_path="/path/to/your/pytorch_weight_path",
-        num_train_steps=30_000,
-    ),
-    TrainConfig(
-        name="pi05_umi_handover_20hz_h16_bs32_10step",
-        project_name="pi05_genoma",
-        model=pi0_config.Pi0Config(pi05=True, action_horizon=16, action_dim=32, discrete_state_input=False),
-        data=LeRobotUmiHandoverDataConfig(
-            repo_id="/groups/gag51454/workspace_makihara/dataset/lerobot_v21_ph2_success_handover",
-            base_config=DataConfig(prompt_from_task=True, lerobot_tolerance_s=0.05),
-            action_sample_stride=3,
-            action_horizon_steps=16,
-        ),
-        batch_size=32,
-        lr_schedule=_optimizer.CosineDecaySchedule(
-            warmup_steps=1,
-            peak_lr=5e-5,
-            decay_steps=1000,
-            decay_lr=5e-5,
-        ),
-        optimizer=_optimizer.AdamW(clip_gradient_norm=1.0),
-        ema_decay=0.999,
-        weight_loader=weight_loaders.CheckpointWeightLoader("gs://openpi-assets/checkpoints/pi05_base/params"),
-        pytorch_weight_path="/path/to/your/pytorch_weight_path",
-        num_train_steps=10,
-        log_interval=1,
-        save_interval=1,
-        keep_period=1,
-    ),
-    TrainConfig(
         name="pi05_umi_original_right_h16_bs32_30k",
         model=pi0_config.Pi0Config(pi05=True, action_horizon=16, action_dim=32, discrete_state_input=False),
         data=LeRobotUmiOriginalDataConfig(
             repo_id="/groups/gag51454/workspace_makihara/dataset/lerobot_v21_ph2_success",
+            base_config=DataConfig(prompt_from_task=True, lerobot_tolerance_s=0.05),
+            downsample_step=3,
+            history_steps=4,
+            action_horizon_steps=16,
+        ),
+        batch_size=32,
+        lr_schedule=_optimizer.CosineDecaySchedule(
+            warmup_steps=10_000,
+            peak_lr=5e-5,
+            decay_steps=1_000_000,
+            decay_lr=5e-5,
+        ),
+        optimizer=_optimizer.AdamW(clip_gradient_norm=1.0),
+        ema_decay=0.999,
+        weight_loader=weight_loaders.CheckpointWeightLoader("gs://openpi-assets/checkpoints/pi05_base/params"),
+        pytorch_weight_path="/path/to/your/pytorch_weight_path",
+        num_train_steps=30_000,
+    ),
+    TrainConfig(
+        name="pi05_umi_original_right_relative_h16_bs32_30k",
+        model=pi0_config.Pi0Config(pi05=True, action_horizon=16, action_dim=32, discrete_state_input=False),
+        data=LeRobotUmiOriginalDataConfig(
+            repo_id="/groups/gag51454/workspace_makihara/dataset/lerobot_v21_ph2_success",
+            base_config=DataConfig(prompt_from_task=True, lerobot_tolerance_s=0.05),
+            downsample_step=3,
+            history_steps=4,
+            action_horizon_steps=16,
+            action_pose_target="relative",
+        ),
+        batch_size=32,
+        lr_schedule=_optimizer.CosineDecaySchedule(
+            warmup_steps=10_000,
+            peak_lr=5e-5,
+            decay_steps=1_000_000,
+            decay_lr=5e-5,
+        ),
+        optimizer=_optimizer.AdamW(clip_gradient_norm=1.0),
+        ema_decay=0.999,
+        weight_loader=weight_loaders.CheckpointWeightLoader("gs://openpi-assets/checkpoints/pi05_base/params"),
+        pytorch_weight_path="/path/to/your/pytorch_weight_path",
+        num_train_steps=30_000,
+    ),
+    TrainConfig(
+        name="pi05_umi_original_right_ep300_h16_bs32_30k",
+        model=pi0_config.Pi0Config(pi05=True, action_horizon=16, action_dim=32, discrete_state_input=False),
+        data=LeRobotUmiOriginalDataConfig(
+            repo_id="/groups/gag51454/workspace_makihara/dataset/lerobot_v21_ph2_success_right_300",
             base_config=DataConfig(prompt_from_task=True, lerobot_tolerance_s=0.05),
             downsample_step=3,
             history_steps=4,
@@ -1133,6 +1141,75 @@ _CONFIGS = [
         keep_period=1,
     ),
     TrainConfig(
+        name="pi05_umi_original_right_third_slot_h16_bs32_30k_10hz",
+        model=pi0_config.Pi0Config(pi05=True, action_horizon=16, action_dim=32, discrete_state_input=False),
+        data=LeRobotUmiOriginalRightThirdSlotDataConfig(
+            repo_id="/groups/gag51454/workspace_makihara/dataset/lerobot_v21_ph2_success_right_v2",
+            base_config=DataConfig(prompt_from_task=True, lerobot_tolerance_s=0.02),
+            downsample_step=6,
+            history_steps=2,
+            action_horizon_steps=16,
+        ),
+        batch_size=32,
+        lr_schedule=_optimizer.CosineDecaySchedule(
+            warmup_steps=10_000,
+            peak_lr=5e-5,
+            decay_steps=1_000_000,
+            decay_lr=5e-5,
+        ),
+        optimizer=_optimizer.AdamW(clip_gradient_norm=1.0),
+        ema_decay=0.999,
+        weight_loader=weight_loaders.CheckpointWeightLoader("gs://openpi-assets/checkpoints/pi05_base/params"),
+        pytorch_weight_path="/path/to/your/pytorch_weight_path",
+        num_train_steps=30_000,
+    ),
+    TrainConfig(
+        name="pi05_umi_original_right_third_slot_h8_bs32_30k_10hz",
+        model=pi0_config.Pi0Config(pi05=True, action_horizon=8, action_dim=32, discrete_state_input=False),
+        data=LeRobotUmiOriginalRightThirdSlotDataConfig(
+            repo_id="/groups/gag51454/workspace_makihara/dataset/lerobot_v21_ph2_success_right_v2",
+            base_config=DataConfig(prompt_from_task=True, lerobot_tolerance_s=0.02),
+            downsample_step=6,
+            history_steps=2,
+            action_horizon_steps=8,
+        ),
+        batch_size=32,
+        lr_schedule=_optimizer.CosineDecaySchedule(
+            warmup_steps=10_000,
+            peak_lr=5e-5,
+            decay_steps=1_000_000,
+            decay_lr=5e-5,
+        ),
+        optimizer=_optimizer.AdamW(clip_gradient_norm=1.0),
+        ema_decay=0.999,
+        weight_loader=weight_loaders.CheckpointWeightLoader("gs://openpi-assets/checkpoints/pi05_base/params"),
+        pytorch_weight_path="/path/to/your/pytorch_weight_path",
+        num_train_steps=30_000,
+    ),
+    TrainConfig(
+        name="pi05_umi_original_right_prev_current_third_slot_h16_bs32_30k_10hz",
+        model=pi0_config.Pi0Config(pi05=True, action_horizon=16, action_dim=32, discrete_state_input=False),
+        data=LeRobotUmiOriginalRightPrevCurrentThirdSlotDataConfig(
+            repo_id="/groups/gag51454/workspace_makihara/dataset/lerobot_v21_ph2_success_right_v2",
+            base_config=DataConfig(prompt_from_task=True, lerobot_tolerance_s=0.02),
+            downsample_step=6,
+            history_steps=4,
+            action_horizon_steps=16,
+        ),
+        batch_size=32,
+        lr_schedule=_optimizer.CosineDecaySchedule(
+            warmup_steps=10_000,
+            peak_lr=5e-5,
+            decay_steps=1_000_000,
+            decay_lr=5e-5,
+        ),
+        optimizer=_optimizer.AdamW(clip_gradient_norm=1.0),
+        ema_decay=0.999,
+        weight_loader=weight_loaders.CheckpointWeightLoader("gs://openpi-assets/checkpoints/pi05_base/params"),
+        pytorch_weight_path="/path/to/your/pytorch_weight_path",
+        num_train_steps=30_000,
+    ),
+    TrainConfig(
         name="pi05_umi_original_bimanual_h16_bs32_30k",
         model=pi0_config.Pi0Config(pi05=True, action_horizon=16, action_dim=32, discrete_state_input=False),
         data=LeRobotUmiOriginalBimanualDataConfig(
@@ -1141,6 +1218,30 @@ _CONFIGS = [
             downsample_step=3,
             history_steps=4,
             action_horizon_steps=16,
+        ),
+        batch_size=32,
+        lr_schedule=_optimizer.CosineDecaySchedule(
+            warmup_steps=10_000,
+            peak_lr=5e-5,
+            decay_steps=1_000_000,
+            decay_lr=5e-5,
+        ),
+        optimizer=_optimizer.AdamW(clip_gradient_norm=1.0),
+        ema_decay=0.999,
+        weight_loader=weight_loaders.CheckpointWeightLoader("gs://openpi-assets/checkpoints/pi05_base/params"),
+        pytorch_weight_path="/path/to/your/pytorch_weight_path",
+        num_train_steps=30_000,
+    ),
+    TrainConfig(
+        name="pi05_umi_original_bimanual_relative_h16_bs32_30k",
+        model=pi0_config.Pi0Config(pi05=True, action_horizon=16, action_dim=32, discrete_state_input=False),
+        data=LeRobotUmiOriginalBimanualDataConfig(
+            repo_id="/groups/gag51454/workspace_makihara/dataset/lerobot_v21_ph2_success",
+            base_config=DataConfig(prompt_from_task=True, lerobot_tolerance_s=0.05),
+            downsample_step=3,
+            history_steps=4,
+            action_horizon_steps=16,
+            action_pose_target="relative",
         ),
         batch_size=32,
         lr_schedule=_optimizer.CosineDecaySchedule(
@@ -1181,72 +1282,6 @@ _CONFIGS = [
         log_interval=1,
         save_interval=1,
         keep_period=1,
-    ),
-    TrainConfig(
-        name="pi05_umi_left_sps_20hz_h16_bs32_30k",
-        model=pi0_config.Pi0Config(pi05=True, action_horizon=16, action_dim=32, discrete_state_input=False),
-        data=LeRobotUmiHandoverDataConfig(
-            repo_id="/groups/gag51454/workspace_makihara/dataset/lerobot_v21_ph2_success_left_sps",
-            base_config=DataConfig(prompt_from_task=True, lerobot_tolerance_s=0.05),
-            action_sample_stride=3,
-            action_horizon_steps=16,
-        ),
-        batch_size=32,
-        lr_schedule=_optimizer.CosineDecaySchedule(
-            warmup_steps=10_000,
-            peak_lr=5e-5,
-            decay_steps=1_000_000,
-            decay_lr=5e-5,
-        ),
-        optimizer=_optimizer.AdamW(clip_gradient_norm=1.0),
-        ema_decay=0.999,
-        weight_loader=weight_loaders.CheckpointWeightLoader("gs://openpi-assets/checkpoints/pi05_base/params"),
-        pytorch_weight_path="/path/to/your/pytorch_weight_path",
-        num_train_steps=30_000,
-    ),
-    TrainConfig(
-        name="pi05_umi_right_sps_20hz_h16_bs32_30k",
-        model=pi0_config.Pi0Config(pi05=True, action_horizon=16, action_dim=32, discrete_state_input=False),
-        data=LeRobotUmiHandoverDataConfig(
-            repo_id="/groups/gag51454/workspace_makihara/dataset/lerobot_v21_ph2_success_right_sps",
-            base_config=DataConfig(prompt_from_task=True, lerobot_tolerance_s=0.05),
-            action_sample_stride=3,
-            action_horizon_steps=16,
-        ),
-        batch_size=32,
-        lr_schedule=_optimizer.CosineDecaySchedule(
-            warmup_steps=10_000,
-            peak_lr=5e-5,
-            decay_steps=1_000_000,
-            decay_lr=5e-5,
-        ),
-        optimizer=_optimizer.AdamW(clip_gradient_norm=1.0),
-        ema_decay=0.999,
-        weight_loader=weight_loaders.CheckpointWeightLoader("gs://openpi-assets/checkpoints/pi05_base/params"),
-        pytorch_weight_path="/path/to/your/pytorch_weight_path",
-        num_train_steps=30_000,
-    ),
-    TrainConfig(
-        name="pi05_umi_tape_20hz_h16_bs32_30k",
-        model=pi0_config.Pi0Config(pi05=True, action_horizon=16, action_dim=32, discrete_state_input=False),
-        data=LeRobotUmiHandoverDataConfig(
-            repo_id="/groups/gag51454/workspace_makihara/dataset/lerobot_v21_ph2_success_tape",
-            base_config=DataConfig(prompt_from_task=True, lerobot_tolerance_s=0.05),
-            action_sample_stride=3,
-            action_horizon_steps=16,
-        ),
-        batch_size=32,
-        lr_schedule=_optimizer.CosineDecaySchedule(
-            warmup_steps=10_000,
-            peak_lr=5e-5,
-            decay_steps=1_000_000,
-            decay_lr=5e-5,
-        ),
-        optimizer=_optimizer.AdamW(clip_gradient_norm=1.0),
-        ema_decay=0.999,
-        weight_loader=weight_loaders.CheckpointWeightLoader("gs://openpi-assets/checkpoints/pi05_base/params"),
-        pytorch_weight_path="/path/to/your/pytorch_weight_path",
-        num_train_steps=30_000,
     ),
     #
     # Fine-tuning Aloha configs.

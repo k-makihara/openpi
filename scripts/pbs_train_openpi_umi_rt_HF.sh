@@ -20,10 +20,10 @@ conda activate airoapi
 cd /groups/gag51454/workspace_makihara/openpi
 
 # Choose one:
-# - pi05_umi_handover_20hz_h16_bs32_30k
-# - pi05_umi_left_sps_20hz_h16_bs32_30k
-# - pi05_umi_tape_20hz_h16_bs32_30k
-CONFIG_NAME="${CONFIG_NAME:-pi05_umi_handover_20hz_h16_bs32_30k}"
+# - pi05_umi_original_right_h16_bs32_30k
+# - pi05_umi_original_bimanual_h16_bs32_30k
+# - pi05_umi_original_right_prev_current_third_slot_h16_bs32_30k_10hz
+CONFIG_NAME="${CONFIG_NAME:-pi05_umi_original_right_h16_bs32_30k}"
 EXP_NAME="${EXP_NAME:-${CONFIG_NAME}_$(date +%Y%m%d_%H%M%S)}"
 
 export GIT_LFS_SKIP_SMUDGE=1

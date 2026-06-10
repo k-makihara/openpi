@@ -8,7 +8,6 @@ import tyro
 
 from openpi.policies import policy as _policy
 from openpi.policies import policy_config as _policy_config
-from openpi.policies import umi_handover_policy as _umi_handover_policy
 from openpi.policies import umi_original_policy as _umi_original_policy
 from openpi.serving import websocket_policy_server
 from openpi.training import config as _config
@@ -38,6 +37,19 @@ class Default:
     """Use the default policy for the given environment."""
 
 
+class UmiActionMode(enum.Enum):
+    AUTO = "auto"
+    DELTA = "delta"
+    RELATIVE = "relative"
+
+
+class UmiImageLayout(enum.Enum):
+    AUTO = "auto"
+    DOUBLE_CURRENT = "double_current"
+    THIRD_SLOT_ONLY = "third_slot_only"
+    PREV_CURRENT_THIRD_SLOT = "prev_current_third_slot"
+
+
 @dataclasses.dataclass
 class Args:
     """Arguments for the serve_policy script."""
@@ -57,10 +69,18 @@ class Args:
     # Specifies how to load the policy. If not provided, the default policy for the environment will be used.
     policy: Checkpoint | Default = dataclasses.field(default_factory=Default)
 
-    # If true, use UMI handover absolute-state input and post-process outputs into per-arm absolute poses.
-    umi_handover_absolute_io: bool = False
     # If true, use right-arm UMI original absolute-state input and post-process outputs into absolute poses.
     umi_original_right_io: bool = False
+    # How to interpret predicted pose actions when converting back to absolute poses.
+    umi_action_mode: UmiActionMode = UmiActionMode.AUTO
+    # How input images should be prepared for UMI original right-arm models.
+    umi_image_layout: UmiImageLayout = UmiImageLayout.AUTO
+
+
+@dataclasses.dataclass(frozen=True)
+class UmiServeSpec:
+    action_mode: UmiActionMode
+    image_layout: UmiImageLayout
 
 
 def _rot6d_to_rotmat(rot6d: np.ndarray) -> np.ndarray:
@@ -104,14 +124,6 @@ def _rotmat_to_quat_xyzw(rotmat: np.ndarray) -> np.ndarray:
     return q / (np.linalg.norm(q) + 1e-8)
 
 
-def _pose_rel9_to_abs_pose7(rel9: np.ndarray, base_pose7: np.ndarray) -> np.ndarray:
-    base_pos_rot6d = _umi_handover_policy._pose7_to_pos_rot6d_batch(base_pose7)[0]
-    abs_pos_rot6d = np.asarray(rel9, dtype=np.float32) + base_pos_rot6d
-    pos = abs_pos_rot6d[:3]
-    quat = _rotmat_to_quat_xyzw(_rot6d_to_rotmat(abs_pos_rot6d[3:9]))
-    return np.concatenate([pos, quat], axis=0).astype(np.float32)
-
-
 def _pose7_to_transform(pose7: np.ndarray) -> np.ndarray:
     pose7 = np.asarray(pose7, dtype=np.float32)
     tf = np.eye(4, dtype=np.float32)
@@ -134,50 +146,6 @@ def _pose9_to_transform(pose9: np.ndarray) -> np.ndarray:
     return tf
 
 
-class UmiAbsoluteIOPolicy(_policy.BasePolicy):
-    """Wrapper policy for UMI handover that accepts absolute state sequences and returns absolute arm-wise outputs."""
-
-    def __init__(self, policy: _policy.BasePolicy, *, history_steps: int = 4, action_horizon_steps: int = 16):
-        self._policy = policy
-        self._to_inputs = _umi_handover_policy.UmiHandoverInputs(
-            history_steps=history_steps, action_horizon_steps=action_horizon_steps
-        )
-        self._metadata = getattr(policy, "metadata", {})
-
-    def infer(self, obs: dict) -> dict:
-        left_pose_seq = np.asarray(obs["left_pose_seq"], dtype=np.float32)
-        right_pose_seq = np.asarray(obs["right_pose_seq"], dtype=np.float32)
-
-        model_inputs = self._to_inputs(obs)
-        raw = self._policy.infer(model_inputs)
-        actions = np.asarray(raw["actions"], dtype=np.float32)
-
-        left_base_pose = left_pose_seq[self._to_inputs.history_steps - 1]
-        right_base_pose = right_pose_seq[self._to_inputs.history_steps - 1]
-        left_abs_pose = np.stack([_pose_rel9_to_abs_pose7(a[:9], left_base_pose) for a in actions], axis=0)
-        right_abs_pose = np.stack([_pose_rel9_to_abs_pose7(a[9:18], right_base_pose) for a in actions], axis=0)
-        # Gripper channels are trained/served in absolute space.
-        left_abs_gripper = actions[:, 18]
-        right_abs_gripper = actions[:, 19]
-
-        return {
-            "left_arm": {
-                "pose": left_abs_pose,  # [H,7] xyz + quaternion(xyzw)
-                "gripper": left_abs_gripper.astype(np.float32),  # [H]
-            },
-            "right_arm": {
-                "pose": right_abs_pose,  # [H,7] xyz + quaternion(xyzw)
-                "gripper": right_abs_gripper.astype(np.float32),  # [H]
-            },
-            "actions": actions,  # original model output (relative 20D)
-            "policy_timing": raw.get("policy_timing", {}),
-        }
-
-    @property
-    def metadata(self) -> dict:
-        return self._metadata
-
-
 class UmiOriginalRightIOPolicy(_policy.BasePolicy):
     """Wrapper for right-arm UMI original models.
 
@@ -185,17 +153,40 @@ class UmiOriginalRightIOPolicy(_policy.BasePolicy):
     Outputs include raw relative actions and integrated absolute targets.
     """
 
-    def __init__(self, policy: _policy.BasePolicy):
+    def __init__(self, policy: _policy.BasePolicy, *, serve_spec: UmiServeSpec):
         self._policy = policy
         self._metadata = getattr(policy, "metadata", {})
+        self._serve_spec = serve_spec
+        self._prev_right_image: np.ndarray | None = None
+
+    def _prepare_right_image(self, obs: dict) -> np.ndarray:
+        layout = self._serve_spec.image_layout
+        if "right_image_seq" in obs:
+            return np.asarray(obs["right_image_seq"], dtype=np.uint8)
+        if "right_image_history" in obs:
+            return np.asarray(obs["right_image_history"], dtype=np.uint8)
+
+        right_image = np.asarray(obs["right_image"], dtype=np.uint8)
+        if layout != UmiImageLayout.PREV_CURRENT_THIRD_SLOT:
+            return right_image
+
+        if "right_image_prev" in obs:
+            prev_image = np.asarray(obs["right_image_prev"], dtype=np.uint8)
+        elif self._prev_right_image is not None:
+            prev_image = self._prev_right_image
+        else:
+            prev_image = right_image
+
+        self._prev_right_image = right_image.copy()
+        return np.stack([prev_image, right_image], axis=0)
 
     def infer(self, obs: dict) -> dict:
-        right_image = np.asarray(obs["right_image"], dtype=np.uint8)
+        right_image = self._prepare_right_image(obs)
         right_pose_seq = np.asarray(obs.get("right_pose_seq", obs.get("pose_seq")), dtype=np.float32)
         right_gripper_seq = np.asarray(obs.get("right_gripper_seq", obs.get("gripper_seq")), dtype=np.float32).reshape(-1)
 
         raw_obs = {
-            "left_image": np.asarray(obs.get("left_image", right_image), dtype=np.uint8),
+            "left_image": np.asarray(obs.get("left_image", obs["right_image"]), dtype=np.uint8),
             "right_image": right_image,
             "pose_seq": right_pose_seq,
             "gripper_seq": right_gripper_seq,
@@ -210,12 +201,17 @@ class UmiOriginalRightIOPolicy(_policy.BasePolicy):
         current_gripper = _umi_original_policy._forward_fill_zeros(right_gripper_seq)[-1]
 
         current_tf = _pose7_to_transform(current_pose)
+        anchor_tf = current_tf.copy()
         abs_pose_seq = []
         abs_gripper_seq = []
         for action in actions:
-            delta_tf = _pose9_to_transform(action[:9])
-            current_tf = current_tf @ delta_tf
-            abs_pose_seq.append(_transform_to_pose7(current_tf))
+            target_tf = _pose9_to_transform(action[:9])
+            if self._serve_spec.action_mode == UmiActionMode.DELTA:
+                current_tf = current_tf @ target_tf
+                abs_tf = current_tf
+            else:
+                abs_tf = anchor_tf @ target_tf
+            abs_pose_seq.append(_transform_to_pose7(abs_tf))
             current_gripper = float(action[9])
             abs_gripper_seq.append(current_gripper)
 
@@ -225,6 +221,8 @@ class UmiOriginalRightIOPolicy(_policy.BasePolicy):
                 "gripper": np.asarray(abs_gripper_seq, dtype=np.float32),
             },
             "actions": actions,
+            "umi_action_mode": self._serve_spec.action_mode.value,
+            "umi_image_layout": self._serve_spec.image_layout.value,
             "policy_timing": raw.get("policy_timing", {}),
         }
 
@@ -274,12 +272,45 @@ def create_policy(args: Args) -> _policy.Policy:
             return create_default_policy(args.env, default_prompt=args.default_prompt)
 
 
+def _resolve_umi_serve_spec(args: Args) -> UmiServeSpec:
+    action_mode = args.umi_action_mode
+    image_layout = args.umi_image_layout
+
+    train_config = None
+    if isinstance(args.policy, Checkpoint):
+        train_config = _config.get_config(args.policy.config)
+        data_config = train_config.data
+
+        if action_mode == UmiActionMode.AUTO:
+            action_pose_target = getattr(data_config, "action_pose_target", "delta")
+            action_mode = UmiActionMode.RELATIVE if action_pose_target == "relative" else UmiActionMode.DELTA
+
+        if image_layout == UmiImageLayout.AUTO:
+            if isinstance(data_config, _config.LeRobotUmiOriginalRightPrevCurrentThirdSlotDataConfig):
+                image_layout = UmiImageLayout.PREV_CURRENT_THIRD_SLOT
+            elif isinstance(data_config, _config.LeRobotUmiOriginalRightThirdSlotDataConfig):
+                image_layout = UmiImageLayout.THIRD_SLOT_ONLY
+            else:
+                image_layout = UmiImageLayout.DOUBLE_CURRENT
+
+    if action_mode == UmiActionMode.AUTO:
+        action_mode = UmiActionMode.DELTA
+    if image_layout == UmiImageLayout.AUTO:
+        image_layout = UmiImageLayout.DOUBLE_CURRENT
+
+    logging.info(
+        "Resolved UMI serve spec: action_mode=%s image_layout=%s%s",
+        action_mode.value,
+        image_layout.value,
+        f" from config={args.policy.config}" if isinstance(args.policy, Checkpoint) else "",
+    )
+    return UmiServeSpec(action_mode=action_mode, image_layout=image_layout)
+
+
 def main(args: Args) -> None:
     policy = create_policy(args)
-    if args.umi_handover_absolute_io:
-        policy = UmiAbsoluteIOPolicy(policy, history_steps=4, action_horizon_steps=16)
     if args.umi_original_right_io:
-        policy = UmiOriginalRightIOPolicy(policy)
+        policy = UmiOriginalRightIOPolicy(policy, serve_spec=_resolve_umi_serve_spec(args))
     policy_metadata = policy.metadata
 
     # Record the policy's behavior.

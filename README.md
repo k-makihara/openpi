@@ -160,16 +160,6 @@ Now we can kick off training with the following command (the `--overwrite` flag 
 XLA_PYTHON_CLIENT_MEM_FRACTION=0.9 uv run scripts/train.py pi05_libero --exp-name=my_experiment --overwrite
 ```
 
-For the UMI-style handover dataset config (`pi05_umi_handover_20hz`) added in this workspace:
-
-```bash
-# Compute norm stats first.
-uv run scripts/compute_norm_stats.py --config-name pi05_umi_handover_20hz
-
-# Train.
-XLA_PYTHON_CLIENT_MEM_FRACTION=0.9 uv run scripts/train.py pi05_umi_handover_20hz --exp-name=umi_handover_20hz_v1 --overwrite
-```
-
 The command will log training progress to the console and save checkpoints to the `checkpoints` directory. You can also monitor training progress on the Weights & Biases dashboard. For maximally using the GPU memory, set `XLA_PYTHON_CLIENT_MEM_FRACTION=0.9` before running training -- this enables JAX to use up to 90% of the GPU memory (vs. the default of 75%).
 
 **Note:** We provide functionality for *reloading* normalization statistics for state / action normalization from pre-training. This can be beneficial if you are fine-tuning to a new task on a robot that was part of our pre-training mixture. For more details on how to reload normalization statistics, see the [norm_stats.md](docs/norm_stats.md) file.
