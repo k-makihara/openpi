@@ -82,6 +82,15 @@ def _pose7_seq_to_rot6d_seq(pose_seq: np.ndarray) -> np.ndarray:
     )
 
 
+def _delta_pose9d_seq_from_absolute(current_pose7: np.ndarray, future_pose_seq_abs: np.ndarray) -> np.ndarray:
+    prev_pose7 = np.asarray(current_pose7, dtype=np.float32)
+    deltas = []
+    for pose7 in np.asarray(future_pose_seq_abs, dtype=np.float32):
+        deltas.append(_relative_pose9d(prev_pose7, pose7))
+        prev_pose7 = pose7
+    return np.asarray(deltas, dtype=np.float32)
+
+
 def _forward_fill_zeros(x: np.ndarray, eps: float = 1e-8) -> np.ndarray:
     x = np.asarray(x, dtype=np.float32).reshape(-1).copy()
     last = 0.0
@@ -105,22 +114,19 @@ def _select_action_target(
     current_pose: np.ndarray,
     future_pose_seq_abs: np.ndarray,
     future_gripper_seq_abs: np.ndarray,
-    delta_pose_seq: np.ndarray,
-    delta_gripper_seq_abs: np.ndarray,
     action_len: int,
     action_pose_target: Literal["delta", "relative"],
 ) -> tuple[np.ndarray, dict[str, np.ndarray]]:
-    delta_pose_seq = np.asarray(delta_pose_seq[:action_len], dtype=np.float32)
-    delta_pose_rot6d = _pose7_seq_to_rot6d_seq(delta_pose_seq)
-    delta_gripper_abs = _forward_fill_zeros(delta_gripper_seq_abs[:action_len])[:, None]
-    delta_actions = np.concatenate([delta_pose_rot6d, delta_gripper_abs], axis=-1)
-
     future_pose_seq_abs = np.asarray(future_pose_seq_abs[:action_len], dtype=np.float32)
+    future_gripper_abs = _forward_fill_zeros(future_gripper_seq_abs[:action_len])[:, None]
+
+    delta_pose9d = _delta_pose9d_seq_from_absolute(current_pose, future_pose_seq_abs)
+    delta_actions = np.concatenate([delta_pose9d, future_gripper_abs], axis=-1)
+
     future_pose_rel = np.asarray(
         [_relative_pose9d(current_pose, pose) for pose in future_pose_seq_abs],
         dtype=np.float32,
     )
-    future_gripper_abs = _forward_fill_zeros(future_gripper_seq_abs[:action_len])[:, None]
     relative_actions = np.concatenate([future_pose_rel, future_gripper_abs], axis=-1)
 
     actions = delta_actions if action_pose_target == "delta" else relative_actions
@@ -151,8 +157,6 @@ class UmiOriginalInputs(transforms.DataTransformFn):
             self.history_steps + self.action_horizon_steps,
             "gripper_seq",
         )
-        action_pose_seq = np.asarray(data["action_pose_seq"], dtype=np.float32)
-        action_gripper_seq = np.asarray(data["action_gripper_seq"], dtype=np.float32).reshape(-1)
 
         hist_len = self.history_steps
         action_len = self.action_horizon_steps
@@ -179,13 +183,11 @@ class UmiOriginalInputs(transforms.DataTransformFn):
             },
         }
 
-        if action_pose_seq.size > 0:
+        if future_pose_seq_abs.size > 0:
             actions, aux = _select_action_target(
                 current_pose=current_pose,
                 future_pose_seq_abs=future_pose_seq_abs,
                 future_gripper_seq_abs=future_gripper_seq_abs,
-                delta_pose_seq=action_pose_seq,
-                delta_gripper_seq_abs=action_gripper_seq,
                 action_len=action_len,
                 action_pose_target=self.action_pose_target,
             )
@@ -224,8 +226,6 @@ class UmiOriginalRightThirdSlotInputs(transforms.DataTransformFn):
             self.history_steps + self.action_horizon_steps,
             "gripper_seq",
         )
-        action_pose_seq = np.asarray(data["action_pose_seq"], dtype=np.float32)
-        action_gripper_seq = np.asarray(data["action_gripper_seq"], dtype=np.float32).reshape(-1)
 
         hist_len = self.history_steps
         action_len = self.action_horizon_steps
@@ -252,13 +252,11 @@ class UmiOriginalRightThirdSlotInputs(transforms.DataTransformFn):
             },
         }
 
-        if action_pose_seq.size > 0:
+        if future_pose_seq_abs.size > 0:
             actions, aux = _select_action_target(
                 current_pose=current_pose,
                 future_pose_seq_abs=future_pose_seq_abs,
                 future_gripper_seq_abs=future_gripper_seq_abs,
-                delta_pose_seq=action_pose_seq,
-                delta_gripper_seq_abs=action_gripper_seq,
                 action_len=action_len,
                 action_pose_target=self.action_pose_target,
             )
@@ -294,8 +292,6 @@ class UmiOriginalRightPrevAndCurrentThirdSlotInputs(transforms.DataTransformFn):
             self.history_steps + self.action_horizon_steps,
             "gripper_seq",
         )
-        action_pose_seq = np.asarray(data["action_pose_seq"], dtype=np.float32)
-        action_gripper_seq = np.asarray(data["action_gripper_seq"], dtype=np.float32).reshape(-1)
 
         hist_len = self.history_steps
         action_len = self.action_horizon_steps
@@ -322,13 +318,11 @@ class UmiOriginalRightPrevAndCurrentThirdSlotInputs(transforms.DataTransformFn):
             },
         }
 
-        if action_pose_seq.size > 0:
+        if future_pose_seq_abs.size > 0:
             actions, aux = _select_action_target(
                 current_pose=current_pose,
                 future_pose_seq_abs=future_pose_seq_abs,
                 future_gripper_seq_abs=future_gripper_seq_abs,
-                delta_pose_seq=action_pose_seq,
-                delta_gripper_seq_abs=action_gripper_seq,
                 action_len=action_len,
                 action_pose_target=self.action_pose_target,
             )
@@ -374,11 +368,6 @@ class UmiOriginalBimanualInputs(transforms.DataTransformFn):
             "right_gripper_seq",
         )
 
-        left_action_pose_seq = np.asarray(data["left_action_pose_seq"], dtype=np.float32)
-        right_action_pose_seq = np.asarray(data["right_action_pose_seq"], dtype=np.float32)
-        left_action_gripper_seq = np.asarray(data["left_action_gripper_seq"], dtype=np.float32).reshape(-1)
-        right_action_gripper_seq = np.asarray(data["right_action_gripper_seq"], dtype=np.float32).reshape(-1)
-
         hist_len = self.history_steps
         action_len = self.action_horizon_steps
 
@@ -417,13 +406,11 @@ class UmiOriginalBimanualInputs(transforms.DataTransformFn):
             },
         }
 
-        if left_action_pose_seq.size > 0:
+        if left_future_pose_seq_abs.size > 0:
             left_actions, left_aux = _select_action_target(
                 current_pose=left_current_pose,
                 future_pose_seq_abs=left_future_pose_seq_abs,
                 future_gripper_seq_abs=left_future_gripper_seq_abs,
-                delta_pose_seq=left_action_pose_seq,
-                delta_gripper_seq_abs=left_action_gripper_seq,
                 action_len=action_len,
                 action_pose_target=self.action_pose_target,
             )
@@ -431,8 +418,6 @@ class UmiOriginalBimanualInputs(transforms.DataTransformFn):
                 current_pose=right_current_pose,
                 future_pose_seq_abs=right_future_pose_seq_abs,
                 future_gripper_seq_abs=right_future_gripper_seq_abs,
-                delta_pose_seq=right_action_pose_seq,
-                delta_gripper_seq_abs=right_action_gripper_seq,
                 action_len=action_len,
                 action_pose_target=self.action_pose_target,
             )

@@ -81,6 +81,8 @@ class Args:
 class UmiServeSpec:
     action_mode: UmiActionMode
     image_layout: UmiImageLayout
+    history_steps: int
+    action_horizon_steps: int
 
 
 def _rot6d_to_rotmat(rot6d: np.ndarray) -> np.ndarray:
@@ -155,9 +157,27 @@ class UmiOriginalRightIOPolicy(_policy.BasePolicy):
 
     def __init__(self, policy: _policy.BasePolicy, *, serve_spec: UmiServeSpec):
         self._policy = policy
-        self._metadata = getattr(policy, "metadata", {})
+        self._metadata = {
+            **getattr(policy, "metadata", {}),
+            "umi_action_mode": serve_spec.action_mode.value,
+            "umi_image_layout": serve_spec.image_layout.value,
+            "umi_history_steps": serve_spec.history_steps,
+            "umi_action_horizon_steps": serve_spec.action_horizon_steps,
+        }
         self._serve_spec = serve_spec
         self._prev_right_image: np.ndarray | None = None
+
+    def _fit_history(self, seq: np.ndarray, *, name: str) -> np.ndarray:
+        seq = np.asarray(seq)
+        expected = self._serve_spec.history_steps
+        if seq.shape[0] == expected:
+            return seq
+        if seq.shape[0] > expected:
+            return seq[-expected:]
+        if seq.shape[0] == 0:
+            raise ValueError(f"{name} must contain at least 1 step.")
+        pad = np.repeat(seq[:1], expected - seq.shape[0], axis=0)
+        return np.concatenate([pad, seq], axis=0)
 
     def _prepare_right_image(self, obs: dict) -> np.ndarray:
         layout = self._serve_spec.image_layout
@@ -182,8 +202,14 @@ class UmiOriginalRightIOPolicy(_policy.BasePolicy):
 
     def infer(self, obs: dict) -> dict:
         right_image = self._prepare_right_image(obs)
-        right_pose_seq = np.asarray(obs.get("right_pose_seq", obs.get("pose_seq")), dtype=np.float32)
-        right_gripper_seq = np.asarray(obs.get("right_gripper_seq", obs.get("gripper_seq")), dtype=np.float32).reshape(-1)
+        right_pose_seq = self._fit_history(
+            np.asarray(obs.get("right_pose_seq", obs.get("pose_seq")), dtype=np.float32),
+            name="right_pose_seq",
+        )
+        right_gripper_seq = self._fit_history(
+            np.asarray(obs.get("right_gripper_seq", obs.get("gripper_seq")), dtype=np.float32).reshape(-1, 1),
+            name="right_gripper_seq",
+        ).reshape(-1)
 
         raw_obs = {
             "left_image": np.asarray(obs.get("left_image", obs["right_image"]), dtype=np.uint8),
@@ -275,8 +301,9 @@ def create_policy(args: Args) -> _policy.Policy:
 def _resolve_umi_serve_spec(args: Args) -> UmiServeSpec:
     action_mode = args.umi_action_mode
     image_layout = args.umi_image_layout
+    history_steps = 4
+    action_horizon_steps = 16
 
-    train_config = None
     if isinstance(args.policy, Checkpoint):
         train_config = _config.get_config(args.policy.config)
         data_config = train_config.data
@@ -293,18 +320,28 @@ def _resolve_umi_serve_spec(args: Args) -> UmiServeSpec:
             else:
                 image_layout = UmiImageLayout.DOUBLE_CURRENT
 
+        history_steps = int(getattr(data_config, "history_steps", history_steps))
+        action_horizon_steps = int(getattr(data_config, "action_horizon_steps", action_horizon_steps))
+
     if action_mode == UmiActionMode.AUTO:
         action_mode = UmiActionMode.DELTA
     if image_layout == UmiImageLayout.AUTO:
         image_layout = UmiImageLayout.DOUBLE_CURRENT
 
     logging.info(
-        "Resolved UMI serve spec: action_mode=%s image_layout=%s%s",
+        "Resolved UMI serve spec: action_mode=%s image_layout=%s history_steps=%s action_horizon_steps=%s%s",
         action_mode.value,
         image_layout.value,
+        history_steps,
+        action_horizon_steps,
         f" from config={args.policy.config}" if isinstance(args.policy, Checkpoint) else "",
     )
-    return UmiServeSpec(action_mode=action_mode, image_layout=image_layout)
+    return UmiServeSpec(
+        action_mode=action_mode,
+        image_layout=image_layout,
+        history_steps=history_steps,
+        action_horizon_steps=action_horizon_steps,
+    )
 
 
 def main(args: Args) -> None:
