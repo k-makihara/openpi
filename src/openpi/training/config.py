@@ -600,6 +600,65 @@ class LeRobotUmiOriginalBimanualDataConfig(DataConfigFactory):
 
 
 @dataclasses.dataclass(frozen=True)
+class LeRobotUmiOriginalDualArmRelativeStateDataConfig(DataConfigFactory):
+    """Bimanual UMI config with inter-arm relative end-effector pose appended to state."""
+
+    default_prompt: str | None = "handover object"
+    downsample_step: int = 3
+    history_steps: int = 4
+    action_horizon_steps: int = 10
+    action_pose_target: str = "delta"
+
+    repack_transforms: tyro.conf.Suppress[_transforms.Group] = dataclasses.field(
+        default=_transforms.Group(
+            inputs=[
+                _transforms.RepackTransform(
+                    {
+                        "left_image": "observation.image.left",
+                        "right_image": "observation.image.right",
+                        "left_pose_seq": "observation.pose.left_controller.absolute",
+                        "right_pose_seq": "observation.pose.right_controller.absolute",
+                        "left_gripper_seq": "observation.state.left_gripper",
+                        "right_gripper_seq": "observation.state.right_gripper",
+                        "prompt": "task",
+                    }
+                )
+            ]
+        )
+    )
+    action_sequence_keys: Sequence[str] = ()
+
+    @override
+    def create(self, assets_dirs: pathlib.Path, model_config: _model.BaseModelConfig) -> DataConfig:
+        step_sec = float(self.downsample_step) / 60.0
+        hist = [-(self.history_steps - 1 - i) * step_sec for i in range(self.history_steps)]
+        fut_abs = [i * step_sec for i in range(self.action_horizon_steps)]
+        return dataclasses.replace(
+            self.create_base_config(assets_dirs, model_config),
+            repack_transforms=self.repack_transforms,
+            data_transforms=_transforms.Group(
+                inputs=[
+                    umi_original_policy.UmiOriginalDualArmRelativeStateInputs(
+                        history_steps=self.history_steps,
+                        action_horizon_steps=self.action_horizon_steps,
+                        action_pose_target=self.action_pose_target,
+                    )
+                ],
+                outputs=[umi_original_policy.UmiOriginalDualArmRelativeStateOutputs()],
+            ),
+            model_transforms=ModelTransformFactory(default_prompt=self.default_prompt)(model_config),
+            action_sequence_keys=self.action_sequence_keys,
+            action_sample_stride=self.downsample_step,
+            delta_timestamps_overrides={
+                "observation.pose.left_controller.absolute": hist + fut_abs,
+                "observation.pose.right_controller.absolute": hist + fut_abs,
+                "observation.state.left_gripper": hist + fut_abs,
+                "observation.state.right_gripper": hist + fut_abs,
+            },
+        )
+
+
+@dataclasses.dataclass(frozen=True)
 class RLDSDroidDataConfig(DataConfigFactory):
     """
     Config for training on DROID, using RLDS data format (for efficient training on larger datasets).
@@ -1150,6 +1209,30 @@ _CONFIGS = [
         num_train_steps=30_000,
     ),
     TrainConfig(
+        name="pi05_umi_original_right_third_slot_relative_h16_bs32_30k_10hz_compliance",
+        model=pi0_config.Pi0Config(pi05=True, action_horizon=16, action_dim=32, discrete_state_input=False),
+        data=LeRobotUmiOriginalRightThirdSlotDataConfig(
+            repo_id="/groups/gag51454/workspace_makihara/dataset/lerobot_v21_ph2_success_compliance",
+            base_config=DataConfig(prompt_from_task=True, lerobot_tolerance_s=0.02),
+            downsample_step=6,
+            history_steps=2,
+            action_horizon_steps=16,
+            action_pose_target="relative",
+        ),
+        batch_size=32,
+        lr_schedule=_optimizer.CosineDecaySchedule(
+            warmup_steps=10_000,
+            peak_lr=5e-5,
+            decay_steps=1_000_000,
+            decay_lr=5e-5,
+        ),
+        optimizer=_optimizer.AdamW(clip_gradient_norm=1.0),
+        ema_decay=0.999,
+        weight_loader=weight_loaders.CheckpointWeightLoader("gs://openpi-assets/checkpoints/pi05_base/params"),
+        pytorch_weight_path="/path/to/your/pytorch_weight_path",
+        num_train_steps=30_000,
+    ),
+    TrainConfig(
         name="pi05_umi_original_right_third_slot_h8_bs32_30k_10hz",
         model=pi0_config.Pi0Config(pi05=True, action_horizon=8, action_dim=32, discrete_state_input=False),
         data=LeRobotUmiOriginalRightThirdSlotDataConfig(
@@ -1248,8 +1331,32 @@ _CONFIGS = [
         data=LeRobotUmiOriginalBimanualDataConfig(
             repo_id="/groups/gag51454/workspace_makihara/dataset/lerobot_v21_ph2_success",
             base_config=DataConfig(prompt_from_task=True, lerobot_tolerance_s=0.05),
-            downsample_step=3,
+            downsample_step=6,
             history_steps=4,
+            action_horizon_steps=16,
+            action_pose_target="relative",
+        ),
+        batch_size=32,
+        lr_schedule=_optimizer.CosineDecaySchedule(
+            warmup_steps=10_000,
+            peak_lr=5e-5,
+            decay_steps=1_000_000,
+            decay_lr=5e-5,
+        ),
+        optimizer=_optimizer.AdamW(clip_gradient_norm=1.0),
+        ema_decay=0.999,
+        weight_loader=weight_loaders.CheckpointWeightLoader("gs://openpi-assets/checkpoints/pi05_base/params"),
+        pytorch_weight_path="/path/to/your/pytorch_weight_path",
+        num_train_steps=30_000,
+    ),
+    TrainConfig(
+        name="pi05_umi_original_dual_arm_relative_state_h16_bs32_30k",
+        model=pi0_config.Pi0Config(pi05=True, action_horizon=16, action_dim=32, discrete_state_input=False),
+        data=LeRobotUmiOriginalDualArmRelativeStateDataConfig(
+            repo_id="/groups/gag51454/workspace_makihara/dataset/lerobot_v21_success_dual",
+            base_config=DataConfig(prompt_from_task=True, lerobot_tolerance_s=0.05),
+            downsample_step=6,
+            history_steps=2,
             action_horizon_steps=16,
             action_pose_target="relative",
         ),

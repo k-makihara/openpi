@@ -71,6 +71,8 @@ class Args:
 
     # If true, use right-arm UMI original absolute-state input and post-process outputs into absolute poses.
     umi_original_right_io: bool = False
+    # If true, use dual-arm UMI original absolute-state input and post-process outputs into absolute poses.
+    umi_original_dual_arm_io: bool = False
     # How to interpret predicted pose actions when converting back to absolute poses.
     umi_action_mode: UmiActionMode = UmiActionMode.AUTO
     # How input images should be prepared for UMI original right-arm models.
@@ -257,6 +259,117 @@ class UmiOriginalRightIOPolicy(_policy.BasePolicy):
         return self._metadata
 
 
+class UmiOriginalDualArmIOPolicy(_policy.BasePolicy):
+    """Wrapper for dual-arm UMI original models.
+
+    Inputs are absolute pose7/gripper histories for both arms.
+    Outputs include raw relative actions and integrated absolute targets for both arms.
+    """
+
+    def __init__(self, policy: _policy.BasePolicy, *, serve_spec: UmiServeSpec):
+        self._policy = policy
+        self._metadata = {
+            **getattr(policy, "metadata", {}),
+            "umi_action_mode": serve_spec.action_mode.value,
+            "umi_history_steps": serve_spec.history_steps,
+            "umi_action_horizon_steps": serve_spec.action_horizon_steps,
+            "umi_input_mode": "dual_arm",
+        }
+        self._serve_spec = serve_spec
+
+    def _fit_history(self, seq: np.ndarray, *, name: str) -> np.ndarray:
+        seq = np.asarray(seq)
+        expected = self._serve_spec.history_steps
+        if seq.shape[0] == expected:
+            return seq
+        if seq.shape[0] > expected:
+            return seq[-expected:]
+        if seq.shape[0] == 0:
+            raise ValueError(f"{name} must contain at least 1 step.")
+        pad = np.repeat(seq[:1], expected - seq.shape[0], axis=0)
+        return np.concatenate([pad, seq], axis=0)
+
+    def infer(self, obs: dict) -> dict:
+        left_image = np.asarray(obs["left_image"], dtype=np.uint8)
+        right_image = np.asarray(obs["right_image"], dtype=np.uint8)
+        left_pose_seq = self._fit_history(np.asarray(obs["left_pose_seq"], dtype=np.float32), name="left_pose_seq")
+        right_pose_seq = self._fit_history(np.asarray(obs["right_pose_seq"], dtype=np.float32), name="right_pose_seq")
+        left_gripper_seq = self._fit_history(
+            np.asarray(obs["left_gripper_seq"], dtype=np.float32).reshape(-1, 1),
+            name="left_gripper_seq",
+        ).reshape(-1)
+        right_gripper_seq = self._fit_history(
+            np.asarray(obs["right_gripper_seq"], dtype=np.float32).reshape(-1, 1),
+            name="right_gripper_seq",
+        ).reshape(-1)
+
+        raw_obs = {
+            "left_image": left_image,
+            "right_image": right_image,
+            "left_pose_seq": left_pose_seq,
+            "right_pose_seq": right_pose_seq,
+            "left_gripper_seq": left_gripper_seq,
+            "right_gripper_seq": right_gripper_seq,
+        }
+        if "prompt" in obs:
+            raw_obs["prompt"] = obs["prompt"]
+
+        raw = self._policy.infer(raw_obs)
+        actions = np.asarray(raw["actions"], dtype=np.float32)
+
+        left_actions = actions[:, :10]
+        right_actions = actions[:, 10:20]
+
+        left_current_tf = _pose7_to_transform(left_pose_seq[-1])
+        right_current_tf = _pose7_to_transform(right_pose_seq[-1])
+        left_anchor_tf = left_current_tf.copy()
+        right_anchor_tf = right_current_tf.copy()
+        left_current_gripper = _umi_original_policy._forward_fill_zeros(left_gripper_seq)[-1]
+        right_current_gripper = _umi_original_policy._forward_fill_zeros(right_gripper_seq)[-1]
+
+        left_abs_pose_seq = []
+        right_abs_pose_seq = []
+        left_abs_gripper_seq = []
+        right_abs_gripper_seq = []
+        for left_action, right_action in zip(left_actions, right_actions, strict=True):
+            left_target_tf = _pose9_to_transform(left_action[:9])
+            right_target_tf = _pose9_to_transform(right_action[:9])
+
+            if self._serve_spec.action_mode == UmiActionMode.DELTA:
+                left_current_tf = left_current_tf @ left_target_tf
+                right_current_tf = right_current_tf @ right_target_tf
+                left_abs_tf = left_current_tf
+                right_abs_tf = right_current_tf
+            else:
+                left_abs_tf = left_anchor_tf @ left_target_tf
+                right_abs_tf = right_anchor_tf @ right_target_tf
+
+            left_abs_pose_seq.append(_transform_to_pose7(left_abs_tf))
+            right_abs_pose_seq.append(_transform_to_pose7(right_abs_tf))
+            left_current_gripper = float(left_action[9])
+            right_current_gripper = float(right_action[9])
+            left_abs_gripper_seq.append(left_current_gripper)
+            right_abs_gripper_seq.append(right_current_gripper)
+
+        return {
+            "left_arm": {
+                "pose": np.asarray(left_abs_pose_seq, dtype=np.float32),
+                "gripper": np.asarray(left_abs_gripper_seq, dtype=np.float32),
+            },
+            "right_arm": {
+                "pose": np.asarray(right_abs_pose_seq, dtype=np.float32),
+                "gripper": np.asarray(right_abs_gripper_seq, dtype=np.float32),
+            },
+            "actions": actions,
+            "umi_action_mode": self._serve_spec.action_mode.value,
+            "policy_timing": raw.get("policy_timing", {}),
+        }
+
+    @property
+    def metadata(self) -> dict:
+        return self._metadata
+
+
 # Default checkpoints that should be used for each environment.
 DEFAULT_CHECKPOINT: dict[EnvMode, Checkpoint] = {
     EnvMode.ALOHA: Checkpoint(
@@ -345,9 +458,14 @@ def _resolve_umi_serve_spec(args: Args) -> UmiServeSpec:
 
 
 def main(args: Args) -> None:
+    if args.umi_original_right_io and args.umi_original_dual_arm_io:
+        raise ValueError("Only one of umi_original_right_io and umi_original_dual_arm_io can be enabled.")
+
     policy = create_policy(args)
     if args.umi_original_right_io:
         policy = UmiOriginalRightIOPolicy(policy, serve_spec=_resolve_umi_serve_spec(args))
+    if args.umi_original_dual_arm_io:
+        policy = UmiOriginalDualArmIOPolicy(policy, serve_spec=_resolve_umi_serve_spec(args))
     policy_metadata = policy.metadata
 
     # Record the policy's behavior.

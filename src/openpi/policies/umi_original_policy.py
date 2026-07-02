@@ -438,3 +438,113 @@ class UmiOriginalBimanualInputs(transforms.DataTransformFn):
 class UmiOriginalBimanualOutputs(transforms.DataTransformFn):
     def __call__(self, data: dict) -> dict:
         return {"actions": np.asarray(data["actions"][:, :20])}
+
+
+@dataclasses.dataclass(frozen=True)
+class UmiOriginalDualArmRelativeStateInputs(transforms.DataTransformFn):
+    """Bimanual UMI transform with inter-arm relative end-effector pose appended to state."""
+
+    history_steps: int = 4
+    action_horizon_steps: int = 10
+    action_pose_target: Literal["delta", "relative"] = "delta"
+
+    def __call__(self, data: dict) -> dict:
+        left_image = _parse_image(data["left_image"])
+        right_image = _parse_image(data["right_image"])
+
+        left_pose_seq = _ensure_sequence_length(
+            np.asarray(data["left_pose_seq"], dtype=np.float32),
+            self.history_steps + self.action_horizon_steps,
+            "left_pose_seq",
+        )
+        right_pose_seq = _ensure_sequence_length(
+            np.asarray(data["right_pose_seq"], dtype=np.float32),
+            self.history_steps + self.action_horizon_steps,
+            "right_pose_seq",
+        )
+        left_gripper_seq = _ensure_sequence_length(
+            np.asarray(data["left_gripper_seq"], dtype=np.float32).reshape(-1),
+            self.history_steps + self.action_horizon_steps,
+            "left_gripper_seq",
+        )
+        right_gripper_seq = _ensure_sequence_length(
+            np.asarray(data["right_gripper_seq"], dtype=np.float32).reshape(-1),
+            self.history_steps + self.action_horizon_steps,
+            "right_gripper_seq",
+        )
+
+        hist_len = self.history_steps
+        action_len = self.action_horizon_steps
+
+        left_hist_pose_seq = left_pose_seq[:hist_len]
+        right_hist_pose_seq = right_pose_seq[:hist_len]
+        left_current_pose = left_hist_pose_seq[-1]
+        right_current_pose = right_hist_pose_seq[-1]
+        left_future_pose_seq_abs = left_pose_seq[hist_len : hist_len + action_len]
+        right_future_pose_seq_abs = right_pose_seq[hist_len : hist_len + action_len]
+        left_future_gripper_seq_abs = left_gripper_seq[hist_len : hist_len + action_len]
+        right_future_gripper_seq_abs = right_gripper_seq[hist_len : hist_len + action_len]
+
+        left_hist_rel = np.asarray(
+            [_relative_pose9d(left_current_pose, pose) for pose in left_hist_pose_seq], dtype=np.float32
+        )
+        right_hist_rel = np.asarray(
+            [_relative_pose9d(right_current_pose, pose) for pose in right_hist_pose_seq], dtype=np.float32
+        )
+        left_gripper_hist = _forward_fill_zeros(left_gripper_seq[:hist_len])[:, None]
+        right_gripper_hist = _forward_fill_zeros(right_gripper_seq[:hist_len])[:, None]
+        left_state_seq = np.concatenate([left_hist_rel, left_gripper_hist], axis=-1)
+        right_state_seq = np.concatenate([right_hist_rel, right_gripper_hist], axis=-1)
+        left_wrt_right = _relative_pose9d(right_current_pose, left_current_pose)
+        right_wrt_left = _relative_pose9d(left_current_pose, right_current_pose)
+        state = np.concatenate(
+            [left_state_seq.reshape(-1), right_state_seq.reshape(-1), left_wrt_right, right_wrt_left],
+            axis=0,
+        ).astype(np.float32)
+
+        inputs = {
+            "state": state,
+            "image": {
+                "base_0_rgb": np.zeros_like(left_image),
+                "left_wrist_0_rgb": left_image,
+                "right_wrist_0_rgb": right_image,
+            },
+            "image_mask": {
+                "base_0_rgb": np.False_,
+                "left_wrist_0_rgb": np.True_,
+                "right_wrist_0_rgb": np.True_,
+            },
+        }
+
+        if left_future_pose_seq_abs.size > 0:
+            left_actions, left_aux = _select_action_target(
+                current_pose=left_current_pose,
+                future_pose_seq_abs=left_future_pose_seq_abs,
+                future_gripper_seq_abs=left_future_gripper_seq_abs,
+                action_len=action_len,
+                action_pose_target=self.action_pose_target,
+            )
+            right_actions, right_aux = _select_action_target(
+                current_pose=right_current_pose,
+                future_pose_seq_abs=right_future_pose_seq_abs,
+                future_gripper_seq_abs=right_future_gripper_seq_abs,
+                action_len=action_len,
+                action_pose_target=self.action_pose_target,
+            )
+            inputs["actions"] = np.concatenate([left_actions, right_actions], axis=-1)
+            inputs["actions_delta"] = np.concatenate([left_aux["actions_delta"], right_aux["actions_delta"]], axis=-1)
+            inputs["actions_relative"] = np.concatenate(
+                [left_aux["actions_relative"], right_aux["actions_relative"]],
+                axis=-1,
+            )
+
+        if "prompt" in data:
+            inputs["prompt"] = data["prompt"]
+
+        return inputs
+
+
+@dataclasses.dataclass(frozen=True)
+class UmiOriginalDualArmRelativeStateOutputs(transforms.DataTransformFn):
+    def __call__(self, data: dict) -> dict:
+        return {"actions": np.asarray(data["actions"][:, :20])}
