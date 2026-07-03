@@ -1,0 +1,37 @@
+{
+  "dataset_dir": "/home/makihara/genoma_data/rosbags/lerobot_v21_ph2_success",
+  "episode": 0,
+  "host": "127.0.0.1",
+  "port": 8000,
+  "history_steps": 2,
+  "requested_horizon_steps": 16,
+  "downsample_step": 6,
+  "num_queries": 13,
+  "mse_all": 0.0003048772341571748,
+  "mae_first_by_dim": {
+    "dx": 0.0009122975752688944,
+    "dy": 0.0002708635001908988,
+    "dz": 0.0005968036130070686,
+    "rot6d_0": 0.00010560567898210138,
+    "rot6d_1": 0.00038036718615330756,
+    "rot6d_2": 0.0005472660413943231,
+    "rot6d_3": 2.2984468159847893e-05,
+    "rot6d_4": 0.0009493706747889519,
+    "rot6d_5": 0.00039185851346701384,
+    "gripper_abs": 0.010282736271619797
+  },
+  "mean_first_abs_pos_err_m": 0.001251411740668118,
+  "mean_first_abs_rot_err_deg": 90.10967243566812,
+  "server_metadata": {
+    "umi_action_mode": "relative",
+    "umi_image_layout": "third_slot_only",
+    "umi_history_steps": 2,
+    "umi_action_horizon_steps": 16,
+    "downsample_step": 6
+  },
+  "artifacts": {
+    "npz": "/home/makihara/openpi/outputs/umi_original_right_server/episode_000000_umi_original_right_server.npz",
+    "png": "/home/makihara/openpi/outputs/umi_original_right_server/episode_000000_umi_original_right_server.png",
+    "trace_jsonl": "/home/makihara/openpi/outputs/umi_original_right_server/episode_000000_umi_original_right_server.trace.jsonl"
+  }
+}

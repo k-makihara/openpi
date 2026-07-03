@@ -85,6 +85,7 @@ class UmiServeSpec:
     image_layout: UmiImageLayout
     history_steps: int
     action_horizon_steps: int
+    downsample_step: int
 
 
 def _rot6d_to_rotmat(rot6d: np.ndarray) -> np.ndarray:
@@ -165,21 +166,21 @@ class UmiOriginalRightIOPolicy(_policy.BasePolicy):
             "umi_image_layout": serve_spec.image_layout.value,
             "umi_history_steps": serve_spec.history_steps,
             "umi_action_horizon_steps": serve_spec.action_horizon_steps,
+            "downsample_step": serve_spec.downsample_step,
         }
         self._serve_spec = serve_spec
         self._prev_right_image: np.ndarray | None = None
 
-    def _fit_history(self, seq: np.ndarray, *, name: str) -> np.ndarray:
+    def _fit_sequence_length(self, seq: np.ndarray, expected: int, *, name: str) -> np.ndarray:
         seq = np.asarray(seq)
-        expected = self._serve_spec.history_steps
         if seq.shape[0] == expected:
             return seq
         if seq.shape[0] > expected:
-            return seq[-expected:]
+            return seq[:expected]
         if seq.shape[0] == 0:
             raise ValueError(f"{name} must contain at least 1 step.")
-        pad = np.repeat(seq[:1], expected - seq.shape[0], axis=0)
-        return np.concatenate([pad, seq], axis=0)
+        pad = np.repeat(seq[-1:], expected - seq.shape[0], axis=0)
+        return np.concatenate([seq, pad], axis=0)
 
     def _prepare_right_image(self, obs: dict) -> np.ndarray:
         layout = self._serve_spec.image_layout
@@ -204,12 +205,18 @@ class UmiOriginalRightIOPolicy(_policy.BasePolicy):
 
     def infer(self, obs: dict) -> dict:
         right_image = self._prepare_right_image(obs)
-        right_pose_seq = self._fit_history(
+        input_seq_len = self._serve_spec.history_steps + self._serve_spec.action_horizon_steps
+        # Online inference only has history. The old training transform also expects
+        # future slots, but those are only used to build supervision targets, not the
+        # model observation. Repeat the latest observation to satisfy the transform.
+        right_pose_seq = self._fit_sequence_length(
             np.asarray(obs.get("right_pose_seq", obs.get("pose_seq")), dtype=np.float32),
+            input_seq_len,
             name="right_pose_seq",
         )
-        right_gripper_seq = self._fit_history(
+        right_gripper_seq = self._fit_sequence_length(
             np.asarray(obs.get("right_gripper_seq", obs.get("gripper_seq")), dtype=np.float32).reshape(-1, 1),
+            input_seq_len,
             name="right_gripper_seq",
         ).reshape(-1)
 
@@ -416,6 +423,7 @@ def _resolve_umi_serve_spec(args: Args) -> UmiServeSpec:
     image_layout = args.umi_image_layout
     history_steps = 4
     action_horizon_steps = 16
+    downsample_step = 1
 
     if isinstance(args.policy, Checkpoint):
         train_config = _config.get_config(args.policy.config)
@@ -435,6 +443,7 @@ def _resolve_umi_serve_spec(args: Args) -> UmiServeSpec:
 
         history_steps = int(getattr(data_config, "history_steps", history_steps))
         action_horizon_steps = int(getattr(data_config, "action_horizon_steps", action_horizon_steps))
+        downsample_step = int(getattr(data_config, "downsample_step", downsample_step))
 
     if action_mode == UmiActionMode.AUTO:
         action_mode = UmiActionMode.DELTA
@@ -442,11 +451,12 @@ def _resolve_umi_serve_spec(args: Args) -> UmiServeSpec:
         image_layout = UmiImageLayout.DOUBLE_CURRENT
 
     logging.info(
-        "Resolved UMI serve spec: action_mode=%s image_layout=%s history_steps=%s action_horizon_steps=%s%s",
+        "Resolved UMI serve spec: action_mode=%s image_layout=%s history_steps=%s action_horizon_steps=%s downsample_step=%s%s",
         action_mode.value,
         image_layout.value,
         history_steps,
         action_horizon_steps,
+        downsample_step,
         f" from config={args.policy.config}" if isinstance(args.policy, Checkpoint) else "",
     )
     return UmiServeSpec(
@@ -454,6 +464,7 @@ def _resolve_umi_serve_spec(args: Args) -> UmiServeSpec:
         image_layout=image_layout,
         history_steps=history_steps,
         action_horizon_steps=action_horizon_steps,
+        downsample_step=downsample_step,
     )
 
 
