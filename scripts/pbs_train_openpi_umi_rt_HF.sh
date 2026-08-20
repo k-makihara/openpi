@@ -1,12 +1,12 @@
 #!/bin/sh
-#PBS -q rt_HF
-#PBS -l select=1:ngpus=8
+#PBS -q R9920261300
+#PBS -l select=1
 #PBS -l walltime=24:00:00
-#PBS -P gag51454
+#PBS -P gai51740
+#PBS -v RTYPE=rt_HF
 #PBS -j oe
 #PBS -k oed
-
-set -eu
+set -eo pipefail
 
 cd "${PBS_O_WORKDIR}"
 
