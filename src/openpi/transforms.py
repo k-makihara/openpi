@@ -135,14 +135,26 @@ class Normalize(DataTransformFn):
         )
 
     def _normalize(self, x, stats: NormStats):
+        self._check_input_dim(x, stats.mean)
         mean, std = stats.mean[..., : x.shape[-1]], stats.std[..., : x.shape[-1]]
         return (x - mean) / (std + 1e-6)
 
     def _normalize_quantile(self, x, stats: NormStats):
         assert stats.q01 is not None
         assert stats.q99 is not None
+        self._check_input_dim(x, stats.q01)
         q01, q99 = stats.q01[..., : x.shape[-1]], stats.q99[..., : x.shape[-1]]
         return (x - q01) / (q99 - q01 + 1e-6) * 2.0 - 1.0
+
+    @staticmethod
+    def _check_input_dim(x, stats_value: np.ndarray) -> None:
+        input_dim = x.shape[-1]
+        stats_dim = stats_value.shape[-1]
+        if input_dim > stats_dim:
+            raise ValueError(
+                f"Input feature dimension {input_dim} exceeds normalization statistics dimension {stats_dim}. "
+                "The inference TrainConfig does not match the checkpoint's data transform or assets."
+            )
 
 
 @dataclasses.dataclass(frozen=True)

@@ -133,3 +133,6 @@ class PolicyRecorder(_base_policy.BasePolicy):
 
         np.save(output_path, np.asarray(data))
         return results
+
+    def reset(self) -> None:
+        self._policy.reset()

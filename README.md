@@ -174,6 +174,24 @@ uv run scripts/serve_policy.py policy:checkpoint --policy.config=pi05_libero --p
 
 This will spin up a server that listens on port 8000 and waits for observations to be sent to it. We can then run an evaluation script (or robot runtime) that queries the server.
 
+For a new locally trained dual-arm UMI checkpoint that is not yet present in `src/openpi/training/config.py`, register an inference config from its checkpoint directory first:
+
+```bash
+python scripts/register_umi_checkpoint_config.py \
+    --checkpoint-dir /path/to/checkpoint/29999
+```
+
+The registration script validates the checkpoint's normalization-stat dimensions and infers the config name, asset ID, history length, action horizon, batch size, and downsampling from the checkpoint hierarchy and naming convention. Use `--dry-run` to inspect the generated config without changing `config.py`. If the source dataset is not 60 Hz or the name does not contain `hz...`, `h...`, and `bs...`, pass the corresponding `--source-hz`, `--effective-hz`, `--action-horizon`, and `--batch-size` options explicitly. The command is idempotent and will not add a duplicate config.
+
+Once registered, a checkpoint in the standard hierarchy can be served with `--policy.dir` alone:
+
+```bash
+python scripts/serve_policy.py \
+    --umi-original-dual-arm-io \
+    policy:checkpoint \
+    --policy.dir /path/to/checkpoint/29999
+```
+
 For running the LIBERO eval in particular, we provide (and recommend using) a Dockerized workflow that handles both the policy server and the evaluation script together. See the [LIBERO README](examples/libero/README.md) for more details.
 
 If you want to embed a policy server call in your own robot runtime, we have a minimal example of how to do so in the [remote inference docs](docs/remote_inference.md).

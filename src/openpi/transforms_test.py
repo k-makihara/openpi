@@ -2,6 +2,7 @@ import numpy as np
 import pytest
 
 import openpi.models.tokenizer as _tokenizer
+from openpi.shared import normalize as _normalize
 import openpi.transforms as _transforms
 
 
@@ -14,6 +15,22 @@ def test_repack_transform():
     )
     item = {"b": {"c": 1}, "e": {"f": 2}}
     assert transform(item) == {"a": {"b": 1}, "d": 2}
+
+
+def test_normalize_rejects_input_larger_than_stats():
+    stats = _normalize.NormStats(
+        mean=np.zeros(58),
+        std=np.ones(58),
+        q01=np.zeros(58),
+        q99=np.ones(58),
+    )
+    transform = _transforms.Normalize({"state": stats}, use_quantiles=True)
+
+    with pytest.raises(
+        ValueError,
+        match="Input feature dimension 98 exceeds normalization statistics dimension 58",
+    ):
+        transform({"state": np.zeros(98)})
 
 
 def test_delta_actions():

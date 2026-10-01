@@ -1,6 +1,9 @@
 import dataclasses
 import enum
+import json
 import logging
+import pathlib
+import re
 import socket
 
 import numpy as np
@@ -26,10 +29,10 @@ class EnvMode(enum.Enum):
 class Checkpoint:
     """Load a policy from a trained checkpoint."""
 
-    # Training config name (e.g., "pi0_aloha_sim").
-    config: str
     # Checkpoint directory (e.g., "checkpoints/pi0_aloha_sim/exp/10000").
     dir: str
+    # Training config name. If omitted, resolve it from a local checkpoint hierarchy.
+    config: str | None = None
 
 
 @dataclasses.dataclass
@@ -89,8 +92,9 @@ class UmiServeSpec:
 
 
 def _rot6d_to_rotmat(rot6d: np.ndarray) -> np.ndarray:
-    a1 = np.asarray(rot6d[:3], dtype=np.float32)
-    a2 = np.asarray(rot6d[3:6], dtype=np.float32)
+    rot6d = np.asarray(rot6d, dtype=np.float32).reshape(6)
+    a1 = np.asarray([rot6d[0], rot6d[2], rot6d[4]], dtype=np.float32)
+    a2 = np.asarray([rot6d[1], rot6d[3], rot6d[5]], dtype=np.float32)
     b1 = a1 / (np.linalg.norm(a1) + 1e-8)
     a2_orth = a2 - np.dot(b1, a2) * b1
     b2 = a2_orth / (np.linalg.norm(a2_orth) + 1e-8)
@@ -261,6 +265,10 @@ class UmiOriginalRightIOPolicy(_policy.BasePolicy):
             "policy_timing": raw.get("policy_timing", {}),
         }
 
+    def reset(self) -> None:
+        self._prev_right_image = None
+        self._policy.reset()
+
     @property
     def metadata(self) -> dict:
         return self._metadata
@@ -280,33 +288,44 @@ class UmiOriginalDualArmIOPolicy(_policy.BasePolicy):
             "umi_action_mode": serve_spec.action_mode.value,
             "umi_history_steps": serve_spec.history_steps,
             "umi_action_horizon_steps": serve_spec.action_horizon_steps,
+            "downsample_step": serve_spec.downsample_step,
             "umi_input_mode": "dual_arm",
         }
         self._serve_spec = serve_spec
 
-    def _fit_history(self, seq: np.ndarray, *, name: str) -> np.ndarray:
+    def _fit_sequence_length(self, seq: np.ndarray, expected: int, *, name: str) -> np.ndarray:
         seq = np.asarray(seq)
-        expected = self._serve_spec.history_steps
         if seq.shape[0] == expected:
             return seq
         if seq.shape[0] > expected:
             return seq[-expected:]
         if seq.shape[0] == 0:
             raise ValueError(f"{name} must contain at least 1 step.")
-        pad = np.repeat(seq[:1], expected - seq.shape[0], axis=0)
-        return np.concatenate([pad, seq], axis=0)
+        pad = np.repeat(seq[-1:], expected - seq.shape[0], axis=0)
+        return np.concatenate([seq, pad], axis=0)
 
     def infer(self, obs: dict) -> dict:
         left_image = np.asarray(obs["left_image"], dtype=np.uint8)
         right_image = np.asarray(obs["right_image"], dtype=np.uint8)
-        left_pose_seq = self._fit_history(np.asarray(obs["left_pose_seq"], dtype=np.float32), name="left_pose_seq")
-        right_pose_seq = self._fit_history(np.asarray(obs["right_pose_seq"], dtype=np.float32), name="right_pose_seq")
-        left_gripper_seq = self._fit_history(
+        input_seq_len = self._serve_spec.history_steps + self._serve_spec.action_horizon_steps
+        left_pose_seq = self._fit_sequence_length(
+            np.asarray(obs["left_pose_seq"], dtype=np.float32),
+            input_seq_len,
+            name="left_pose_seq",
+        )
+        right_pose_seq = self._fit_sequence_length(
+            np.asarray(obs["right_pose_seq"], dtype=np.float32),
+            input_seq_len,
+            name="right_pose_seq",
+        )
+        left_gripper_seq = self._fit_sequence_length(
             np.asarray(obs["left_gripper_seq"], dtype=np.float32).reshape(-1, 1),
+            input_seq_len,
             name="left_gripper_seq",
         ).reshape(-1)
-        right_gripper_seq = self._fit_history(
+        right_gripper_seq = self._fit_sequence_length(
             np.asarray(obs["right_gripper_seq"], dtype=np.float32).reshape(-1, 1),
+            input_seq_len,
             name="right_gripper_seq",
         ).reshape(-1)
 
@@ -372,6 +391,9 @@ class UmiOriginalDualArmIOPolicy(_policy.BasePolicy):
             "policy_timing": raw.get("policy_timing", {}),
         }
 
+    def reset(self) -> None:
+        self._policy.reset()
+
     @property
     def metadata(self) -> dict:
         return self._metadata
@@ -398,6 +420,34 @@ DEFAULT_CHECKPOINT: dict[EnvMode, Checkpoint] = {
 }
 
 
+def _resolve_checkpoint_config(checkpoint: Checkpoint) -> _config.TrainConfig:
+    if checkpoint.config is not None:
+        return _config.get_config(checkpoint.config)
+
+    checkpoint_path = pathlib.Path(checkpoint.dir).expanduser()
+    candidates: list[str] = []
+    if checkpoint_path.name.isdigit():
+        candidates.append(checkpoint_path.parent.parent.name)
+        candidates.append(re.sub(r"_20\d{6}_\d{6}$", "", checkpoint_path.parent.name))
+    candidates.extend([checkpoint_path.name, checkpoint_path.parent.name])
+
+    for candidate in dict.fromkeys(candidates):
+        try:
+            train_config = _config.get_config(candidate)
+        except ValueError:
+            continue
+        checkpoint.config = candidate
+        logging.info("Resolved training config '%s' from checkpoint path", candidate)
+        return train_config
+
+    raise ValueError(
+        "Could not resolve a registered training config from checkpoint path "
+        f"'{checkpoint.dir}'. Register it with "
+        f"'python scripts/register_umi_checkpoint_config.py --checkpoint-dir {checkpoint.dir}', "
+        "or pass --policy.config explicitly."
+    )
+
+
 def create_default_policy(env: EnvMode, *, default_prompt: str | None = None) -> _policy.Policy:
     """Create a default policy for the given environment."""
     if checkpoint := DEFAULT_CHECKPOINT.get(env):
@@ -412,7 +462,7 @@ def create_policy(args: Args) -> _policy.Policy:
     match args.policy:
         case Checkpoint():
             return _policy_config.create_trained_policy(
-                _config.get_config(args.policy.config), args.policy.dir, default_prompt=args.default_prompt
+                _resolve_checkpoint_config(args.policy), args.policy.dir, default_prompt=args.default_prompt
             )
         case Default():
             return create_default_policy(args.env, default_prompt=args.default_prompt)
@@ -426,7 +476,7 @@ def _resolve_umi_serve_spec(args: Args) -> UmiServeSpec:
     downsample_step = 1
 
     if isinstance(args.policy, Checkpoint):
-        train_config = _config.get_config(args.policy.config)
+        train_config = _resolve_checkpoint_config(args.policy)
         data_config = train_config.data
 
         if action_mode == UmiActionMode.AUTO:
@@ -444,6 +494,17 @@ def _resolve_umi_serve_spec(args: Args) -> UmiServeSpec:
         history_steps = int(getattr(data_config, "history_steps", history_steps))
         action_horizon_steps = int(getattr(data_config, "action_horizon_steps", action_horizon_steps))
         downsample_step = int(getattr(data_config, "downsample_step", downsample_step))
+
+        if args.umi_original_dual_arm_io:
+            checkpoint_state_dim = _read_local_checkpoint_norm_dim(args.policy.dir, "state")
+            expected_state_dim = 20 * history_steps + 18
+            if checkpoint_state_dim is not None and checkpoint_state_dim != expected_state_dim:
+                raise ValueError(
+                    "Dual-arm UMI TrainConfig/checkpoint mismatch: "
+                    f"config history_steps={history_steps} produces state_dim={expected_state_dim}, "
+                    f"but checkpoint normalization stats use state_dim={checkpoint_state_dim}. "
+                    "Use the TrainConfig that was used to train this checkpoint."
+                )
 
     if action_mode == UmiActionMode.AUTO:
         action_mode = UmiActionMode.DELTA
@@ -468,15 +529,38 @@ def _resolve_umi_serve_spec(args: Args) -> UmiServeSpec:
     )
 
 
+def _read_local_checkpoint_norm_dim(checkpoint_dir: str, key: str) -> int | None:
+    if "://" in checkpoint_dir:
+        return None
+    stats_paths = sorted(pathlib.Path(checkpoint_dir).expanduser().glob("assets/*/norm_stats.json"))
+    if len(stats_paths) != 1:
+        return None
+    payload = json.loads(stats_paths[0].read_text(encoding="utf-8"))
+    norm_stats = payload.get("norm_stats", payload)
+    stats = norm_stats.get(key)
+    if not isinstance(stats, dict):
+        return None
+    values = stats.get("q01", stats.get("mean"))
+    if values is None:
+        return None
+    return int(np.asarray(values).shape[-1])
+
+
 def main(args: Args) -> None:
     if args.umi_original_right_io and args.umi_original_dual_arm_io:
         raise ValueError("Only one of umi_original_right_io and umi_original_dual_arm_io can be enabled.")
 
+    serve_spec = None
+    if args.umi_original_right_io or args.umi_original_dual_arm_io:
+        serve_spec = _resolve_umi_serve_spec(args)
+
     policy = create_policy(args)
     if args.umi_original_right_io:
-        policy = UmiOriginalRightIOPolicy(policy, serve_spec=_resolve_umi_serve_spec(args))
+        assert serve_spec is not None
+        policy = UmiOriginalRightIOPolicy(policy, serve_spec=serve_spec)
     if args.umi_original_dual_arm_io:
-        policy = UmiOriginalDualArmIOPolicy(policy, serve_spec=_resolve_umi_serve_spec(args))
+        assert serve_spec is not None
+        policy = UmiOriginalDualArmIOPolicy(policy, serve_spec=serve_spec)
     policy_metadata = policy.metadata
 
     # Record the policy's behavior.

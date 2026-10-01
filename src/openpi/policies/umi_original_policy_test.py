@@ -52,7 +52,11 @@ def test_dual_arm_relative_state_config_registered():
     data_config = config.data.create(config.assets_dirs, config.model)
 
     assert config.model.action_dim == 32
+    assert config.model.action_horizon == 16
     assert isinstance(config.data, training_config.LeRobotUmiOriginalDualArmRelativeStateDataConfig)
+    assert config.data.history_steps == 2
+    assert config.data.action_horizon_steps == 16
+    assert config.data.downsample_step == 6
     assert isinstance(
         data_config.data_transforms.inputs[0],
         umi_original_policy.UmiOriginalDualArmRelativeStateInputs,

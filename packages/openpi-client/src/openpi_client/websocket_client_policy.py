@@ -55,4 +55,14 @@ class WebsocketClientPolicy(_base_policy.BasePolicy):
 
     @override
     def reset(self) -> None:
-        pass
+        if not bool(self._server_metadata.get("supports_reset", False)):
+            raise RuntimeError(
+                "Inference server does not support reset. Restart it with the updated websocket server."
+            )
+        self._ws.send(self._packer.pack({"__openpi_request__": "reset"}))
+        response = self._ws.recv()
+        if isinstance(response, str):
+            raise RuntimeError(f"Error resetting inference server:\n{response}")
+        result = msgpack_numpy.unpackb(response)
+        if not bool(result.get("reset", False)):
+            raise RuntimeError(f"Inference server did not acknowledge reset: {result}")

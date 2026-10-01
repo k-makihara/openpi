@@ -15,7 +15,7 @@ logger = logging.getLogger(__name__)
 class WebsocketPolicyServer:
     """Serves a policy using the websocket protocol. See websocket_client_policy.py for a client implementation.
 
-    Currently only implements the `load` and `infer` methods.
+    Implements inference and an explicit reset request for stateful policy wrappers.
     """
 
     def __init__(
@@ -28,7 +28,7 @@ class WebsocketPolicyServer:
         self._policy = policy
         self._host = host
         self._port = port
-        self._metadata = metadata or {}
+        self._metadata = {**(metadata or {}), "supports_reset": True}
         logging.getLogger("websockets.server").setLevel(logging.INFO)
 
     def serve_forever(self) -> None:
@@ -56,6 +56,13 @@ class WebsocketPolicyServer:
             try:
                 start_time = time.monotonic()
                 obs = msgpack_numpy.unpackb(await websocket.recv())
+
+                if isinstance(obs, dict) and obs.get("__openpi_request__") == "reset":
+                    self._policy.reset()
+                    await websocket.send(packer.pack({"reset": True}))
+                    prev_total_time = None
+                    logger.info(f"Policy reset requested by {websocket.remote_address}")
+                    continue
 
                 infer_time = time.monotonic()
                 action = self._policy.infer(obs)
