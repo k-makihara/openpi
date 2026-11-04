@@ -1,4 +1,7 @@
 from collections.abc import Iterator, Sequence
+import bisect
+import dataclasses
+import json
 import logging
 import multiprocessing
 import os
@@ -13,11 +16,23 @@ import numpy as np
 import torch
 
 import openpi.models.model as _model
+import openpi.policies.umi_original_policy as _umi_original_policy
 import openpi.training.config as _config
 from openpi.training.droid_rlds_dataset import DroidRldsDataset
 import openpi.transforms as _transforms
 
 T_co = TypeVar("T_co", covariant=True)
+
+
+_UMI_GRIPPER_INPUT_TRANSFORMS = (
+    _umi_original_policy.UmiOriginalInputs,
+    _umi_original_policy.UmiOriginalRightThirdSlotInputs,
+    _umi_original_policy.UmiOriginalRightPrevAndCurrentThirdSlotInputs,
+    _umi_original_policy.UmiOriginalBimanualInputs,
+    _umi_original_policy.UmiOriginalDualArmRelativeStateInputs,
+)
+_GRIPPER_TRANSFORM_MARKER = pathlib.Path("meta/gripper_transform.json")
+_LEROBOT_EXCLUDED_EPISODE_PATHS: set[str] = set()
 
 
 class Dataset(Protocol[T_co]):
@@ -85,6 +100,38 @@ class RetryOnErrorDataset(Dataset[T_co]):
 
     def __len__(self) -> int:
         return len(self._dataset)
+
+
+class EpisodeAnchorStrideDataset(Dataset[T_co]):
+    """Subsample anchor frames within each episode without changing temporal queries."""
+
+    def __init__(self, dataset: Dataset[T_co], episode_data_index: dict[str, torch.Tensor], stride: int):
+        if stride < 1:
+            raise ValueError(f"Anchor sample stride must be positive, got {stride}.")
+        self._dataset = dataset
+        self._stride = stride
+        self._episode_starts = tuple(int(index) for index in episode_data_index["from"])
+        episode_ends = tuple(int(index) for index in episode_data_index["to"])
+        self._sample_ends = []
+        sample_count = 0
+        for start, end in zip(self._episode_starts, episode_ends, strict=True):
+            sample_count += (end - start + stride - 1) // stride
+            self._sample_ends.append(sample_count)
+
+    def __getitem__(self, index: SupportsIndex) -> T_co:
+        sample_index = index.__index__()
+        if sample_index < 0:
+            sample_index += len(self)
+        if sample_index < 0 or sample_index >= len(self):
+            raise IndexError(sample_index)
+
+        episode_position = bisect.bisect_right(self._sample_ends, sample_index)
+        previous_end = self._sample_ends[episode_position - 1] if episode_position > 0 else 0
+        source_index = self._episode_starts[episode_position] + (sample_index - previous_end) * self._stride
+        return self._dataset[source_index]
+
+    def __len__(self) -> int:
+        return self._sample_ends[-1] if self._sample_ends else 0
 
 
 class IterableTransformedDataset(IterableDataset[T_co]):
@@ -182,24 +229,191 @@ def _patch_lerobot_aggregate_stats() -> None:
         # Keep only files that actually exist locally. This avoids forcing HF fallback
         # when dataset metadata contains optional/missing video streams.
         fpaths = original_get_episode_paths(self)
-        return [fp for fp in fpaths if (self.root / fp).is_file()]
+        return [
+            fp
+            for fp in fpaths
+            if (self.root / fp).is_file() and not _is_episode_path_excluded(self.root, fp, _LEROBOT_EXCLUDED_EPISODE_PATHS)
+        ]
 
     lerobot_dataset.LeRobotDataset.get_episodes_file_paths = _safe_get_episodes_file_paths
     _LEROBOT_STATS_PATCHED = True
 
 
+def _episode_path_variants(dataset_root: pathlib.Path, episode_path: str | pathlib.Path) -> set[str]:
+    path = pathlib.Path(episode_path).expanduser()
+    variants = {path.as_posix()}
+    if path.is_absolute():
+        resolved = path.resolve()
+        variants.add(resolved.as_posix())
+        try:
+            variants.add(resolved.relative_to(dataset_root.resolve()).as_posix())
+        except ValueError:
+            pass
+    else:
+        resolved = (dataset_root / path).resolve()
+        variants.add(resolved.as_posix())
+        variants.add((dataset_root / path).as_posix())
+    return variants
+
+
+def _is_episode_path_excluded(
+    dataset_root: pathlib.Path,
+    episode_path: str | pathlib.Path,
+    excluded_episode_paths: set[str],
+) -> bool:
+    return bool(_episode_path_variants(dataset_root, episode_path) & excluded_episode_paths)
+
+
+def _configure_lerobot_episode_exclusions(dataset_root: pathlib.Path, excluded_episode_paths: Sequence[str]) -> None:
+    global _LEROBOT_EXCLUDED_EPISODE_PATHS
+    _LEROBOT_EXCLUDED_EPISODE_PATHS = set()
+    for episode_path in excluded_episode_paths:
+        _LEROBOT_EXCLUDED_EPISODE_PATHS.update(_episode_path_variants(dataset_root, episode_path))
+
+
+def _filtered_episode_indices(
+    dataset_root: pathlib.Path,
+    dataset_meta: lerobot_dataset.LeRobotDatasetMetadata,
+    excluded_episode_paths: Sequence[str],
+) -> list[int]:
+    available_episode_indices = sorted(dataset_meta.episodes)
+    if not excluded_episode_paths:
+        return available_episode_indices
+
+    requested_paths = [
+        (episode_path, _episode_path_variants(dataset_root, episode_path))
+        for episode_path in excluded_episode_paths
+    ]
+    matched_requests: set[int] = set()
+    excluded_episode_indices = []
+    retained_episode_indices = []
+    for episode_index in available_episode_indices:
+        episode_variants = _episode_path_variants(dataset_root, dataset_meta.get_data_file_path(episode_index))
+        matching_requests = {
+            request_index
+            for request_index, (_, requested_variants) in enumerate(requested_paths)
+            if episode_variants & requested_variants
+        }
+        if matching_requests:
+            matched_requests.update(matching_requests)
+            excluded_episode_indices.append(episode_index)
+        else:
+            retained_episode_indices.append(episode_index)
+
+    unmatched_paths = [path for index, (path, _) in enumerate(requested_paths) if index not in matched_requests]
+    if unmatched_paths:
+        raise ValueError(f"Excluded episode path(s) did not match dataset metadata: {unmatched_paths}")
+
+    logging.warning(
+        "Excluding LeRobot episode indices from training: %s",
+        ", ".join(map(str, excluded_episode_indices)),
+    )
+    return retained_episode_indices
+
+
+class EpisodeSubsetLeRobotDataset(lerobot_dataset.LeRobotDataset):
+    """LeRobot dataset that supports non-contiguous episode selections."""
+
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self._video_timestamp_offsets: dict[int, float] = {}
+        self._episode_position_by_index = (
+            {episode_index: position for position, episode_index in enumerate(self.episodes)}
+            if self.episodes is not None
+            else None
+        )
+
+    def _get_query_indices(self, idx: int, ep_idx: int):
+        if self._episode_position_by_index is not None:
+            ep_idx = self._episode_position_by_index[ep_idx]
+        return super()._get_query_indices(idx, ep_idx)
+
+    def _query_videos(self, query_timestamps: dict[str, list[float]], ep_idx: int) -> dict[str, torch.Tensor]:
+        if ep_idx not in self._video_timestamp_offsets:
+            episode_position = (
+                self._episode_position_by_index[ep_idx]
+                if self._episode_position_by_index is not None
+                else ep_idx
+            )
+            episode_start = int(self.episode_data_index["from"][episode_position])
+            self._video_timestamp_offsets[ep_idx] = float(self.hf_dataset[episode_start]["timestamp"])
+
+        offset = self._video_timestamp_offsets[ep_idx]
+        normalized_timestamps = {
+            key: [max(0.0, timestamp - offset) for timestamp in timestamps]
+            for key, timestamps in query_timestamps.items()
+        }
+        return super()._query_videos(normalized_timestamps, ep_idx)
+
+
+class GroupedQueryLeRobotDataset(EpisodeSubsetLeRobotDataset):
+    """Fetch columns sharing temporal indices together and reuse column views."""
+
+    def _query_columns(self, keys: tuple[str, ...], indices: list[int]) -> dict:
+        # select() constructs a new Dataset and copies its metadata on every
+        # query. Cache column views, then gather rows directly instead. This also
+        # avoids converting unrelated columns to tensors for temporal queries.
+        if not hasattr(self, "_stats_column_views"):
+            self._stats_column_views = {}
+        if keys not in self._stats_column_views:
+            self._stats_column_views[keys] = self.hf_dataset.select_columns(list(keys))
+        return self._stats_column_views[keys][indices]
+
+    def _query_hf_dataset(self, query_indices: dict[str, list[int]]) -> dict:
+        grouped: dict[tuple[int, ...], list[str]] = {}
+        for key, indices in query_indices.items():
+            if key not in self.meta.video_keys:
+                grouped.setdefault(tuple(indices), []).append(key)
+        result = {}
+        for indices, keys in grouped.items():
+            rows = self._query_columns(tuple(keys), list(indices))
+            result.update({key: torch.stack(rows[key]) for key in keys})
+        return result
+
+
+class VideoFreeLeRobotDataset(GroupedQueryLeRobotDataset):
+    """Stats-only dataset: preserve temporal queries but replace videos with tiny placeholders.
+
+    Use only when state/action transforms do not depend on image contents. Keeping
+    camera keys and temporal dimensions lets the normal repack/UMI transforms run.
+    This class is module-level so spawned data-loader workers can pickle it.
+    """
+
+    def _get_query_timestamps(
+        self, current_ts: float, query_indices: dict[str, list[int]] | None = None
+    ) -> dict[str, list[float]]:
+        # Only the number of frames matters for placeholder videos. Preserve
+        # temporal dimensions without fetching timestamps from the dataset.
+        return {
+            key: [current_ts] * (len(query_indices[key]) if query_indices is not None and key in query_indices else 1)
+            for key in self.meta.video_keys
+        }
+
+    def _query_videos(self, query_timestamps: dict[str, list[float]], ep_idx: int) -> dict[str, torch.Tensor]:
+        return {
+            key: torch.zeros((len(timestamps), 3, 1, 1), dtype=torch.float32).squeeze(0)
+            for key, timestamps in query_timestamps.items()
+        }
+
+
 def create_torch_dataset(
-    data_config: _config.DataConfig, action_horizon: int, model_config: _model.BaseModelConfig
+    data_config: _config.DataConfig,
+    action_horizon: int,
+    model_config: _model.BaseModelConfig,
+    *,
+    skip_video_decode: bool = False,
 ) -> Dataset:
     """Create a dataset for training."""
     repo_id = data_config.repo_id
     if repo_id is None:
         raise ValueError("Repo ID is not set. Cannot create dataset.")
     if repo_id == "fake":
+        _configure_lerobot_episode_exclusions(pathlib.Path("."), ())
         return FakeDataset(model_config, num_samples=1024)
 
     _patch_lerobot_aggregate_stats()
     dataset_kwargs = {}
+    _configure_lerobot_episode_exclusions(pathlib.Path("."), ())
     local_repo_id = repo_id
     if repo_id is not None and (repo_id.startswith("/") or pathlib.Path(repo_id).exists()):
         repo_path = pathlib.Path(repo_id).expanduser().resolve()
@@ -214,15 +428,38 @@ def create_torch_dataset(
                 )
         local_repo_id = repo_path.name
         dataset_kwargs["root"] = str(repo_path)
+        _configure_lerobot_episode_exclusions(repo_path, data_config.excluded_episode_paths)
 
     dataset_meta = lerobot_dataset.LeRobotDatasetMetadata(local_repo_id, **dataset_kwargs)
+    if repo_id is not None and (repo_id.startswith("/") or pathlib.Path(repo_id).exists()):
+        retained_episode_indices = _filtered_episode_indices(
+            pathlib.Path(dataset_kwargs["root"]), dataset_meta, data_config.excluded_episode_paths
+        )
+        if retained_episode_indices:
+            dataset_kwargs["episodes"] = retained_episode_indices
+        else:
+            raise ValueError(
+                "All episodes were excluded from the dataset. Check data.excluded_episode_paths and try again."
+            )
     stride = max(1, int(data_config.action_sample_stride))
     delta_timestamps = data_config.delta_timestamps_overrides
     if delta_timestamps is None:
         delta_timestamps = {
             key: [(t * stride) / dataset_meta.fps for t in range(action_horizon)] for key in data_config.action_sequence_keys
         }
-    dataset = lerobot_dataset.LeRobotDataset(
+    if skip_video_decode:
+        dataset_class = VideoFreeLeRobotDataset
+    elif data_config.lerobot_table_query_mode == "grouped":
+        dataset_class = GroupedQueryLeRobotDataset
+    elif data_config.lerobot_table_query_mode == "legacy":
+        dataset_class = EpisodeSubsetLeRobotDataset
+    else:
+        raise ValueError(f"Unknown table query mode: {data_config.lerobot_table_query_mode}")
+    logging.info(
+        "LeRobot dataset class: %s (table_query_mode=%s, skip_video_decode=%s)",
+        dataset_class.__name__, data_config.lerobot_table_query_mode, skip_video_decode,
+    )
+    dataset = dataset_class(
         local_repo_id,
         delta_timestamps=delta_timestamps,
         tolerance_s=float(data_config.lerobot_tolerance_s),
@@ -233,12 +470,22 @@ def create_torch_dataset(
     # Some local datasets include video features in metadata without corresponding files.
     # Disable such streams so __getitem__ does not attempt to decode missing videos.
     for key, ft in dataset.meta.features.items():
-        if ft.get("dtype") != "video":
+        if skip_video_decode or ft.get("dtype") != "video":
             continue
         any_found = any((dataset.root / dataset.meta.get_video_file_path(ep, key)).is_file() for ep in dataset.meta.episodes)
         if not any_found:
             logging.warning("Disabling missing video stream '%s' from dataset metadata.", key)
             ft["dtype"] = "unsupported"
+
+    if data_config.downsample_anchor_frames and stride > 1:
+        original_size = len(dataset)
+        dataset = EpisodeAnchorStrideDataset(dataset, dataset.episode_data_index, stride)
+        logging.info(
+            "Downsampled LeRobot anchor frames by %d: %d -> %d samples.",
+            stride,
+            original_size,
+            len(dataset),
+        )
 
     if data_config.prompt_from_task:
         dataset = TransformedDataset(dataset, [_transforms.PromptFromLeRobotTask(dataset_meta.tasks)])
@@ -363,6 +610,42 @@ def create_data_loader(
     )
 
 
+def _configure_preprocessed_gripper_data(data_config: _config.DataConfig) -> _config.DataConfig:
+    repo_id = data_config.repo_id
+    if repo_id is None:
+        return data_config
+
+    repo_path = pathlib.Path(repo_id).expanduser()
+    if not repo_path.exists():
+        return data_config
+
+    marker_path = repo_path.resolve() / _GRIPPER_TRANSFORM_MARKER
+    if not marker_path.is_file():
+        return data_config
+
+    marker = json.loads(marker_path.read_text())
+    if marker.get("transform") != "openpi_umi_gripper_v2":
+        raise ValueError(f"Unsupported gripper transform marker: {marker_path}")
+
+    transformed_inputs = []
+    found_umi_transform = False
+    for transform in data_config.data_transforms.inputs:
+        configured_transform = transform
+        if isinstance(transform, _UMI_GRIPPER_INPUT_TRANSFORMS):
+            configured_transform = dataclasses.replace(transform, gripper_preprocessed=True)
+            found_umi_transform = True
+        transformed_inputs.append(configured_transform)
+
+    if not found_umi_transform:
+        raise ValueError(f"Dataset is marked as UMI gripper-preprocessed but config has no UMI transform: {repo_path}")
+
+    logging.info("Using preprocessed gripper values from dataset marker: %s", marker_path)
+    return dataclasses.replace(
+        data_config,
+        data_transforms=dataclasses.replace(data_config.data_transforms, inputs=tuple(transformed_inputs)),
+    )
+
+
 def create_torch_data_loader(
     data_config: _config.DataConfig,
     model_config: _model.BaseModelConfig,
@@ -394,6 +677,7 @@ def create_torch_data_loader(
             execute in the main process.
         seed: The seed to use for shuffling the data.
     """
+    data_config = _configure_preprocessed_gripper_data(data_config)
     dataset = create_torch_dataset(data_config, action_horizon, model_config)
     dataset = transform_dataset(dataset, data_config, skip_norm_stats=skip_norm_stats)
 

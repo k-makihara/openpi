@@ -168,3 +168,9 @@ cython_debug/
 #.idea/
 
 *.sh.*
+
+*.err
+*.out
+outputs
+pipelines
+checkpoints*

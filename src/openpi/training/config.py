@@ -90,6 +90,9 @@ class DataConfig:
     # Sample every N-th frame when building the action sequence.
     # For example, for a 60Hz dataset use 3 to train with an effective 20Hz action chunk.
     action_sample_stride: int = 1
+    # If true, also sample anchor frames at action_sample_stride within each episode.
+    # If false, every frame remains an anchor and only temporal queries use the stride.
+    downsample_anchor_frames: bool = False
     # Optional explicit delta_timestamps (in seconds) for specific dataset keys.
     # If set, these are passed directly to LeRobotDataset and take precedence over action_sequence_keys.
     delta_timestamps_overrides: dict[str, Sequence[float]] | None = None
@@ -98,9 +101,15 @@ class DataConfig:
     # Video decoder backend for LeRobot datasets. "pyav" is often more robust
     # than torchcodec for boundary-frame access on some datasets.
     lerobot_video_backend: str | None = "pyav"
+    # Opt-in grouped temporal reads; legacy preserves existing training behavior.
+    lerobot_table_query_mode: Literal["legacy", "grouped"] = "legacy"
 
     # If true, will use the LeRobot dataset task to define the prompt.
     prompt_from_task: bool = False
+
+    # Optional list of episode file paths to exclude at training time.
+    # Paths may be relative to the dataset root or absolute; matching is normalized in the data loader.
+    excluded_episode_paths: Sequence[str] = ()
 
     # Only used for RLDS data loader (ie currently only used for DROID).
     rlds_data_dir: str | None = None
@@ -179,6 +188,14 @@ class ModelTransformFactory(GroupFactory):
 class DataConfigFactory(abc.ABC):
     # The LeRobot repo id.
     repo_id: str = tyro.MISSING
+    # Whether to downsample anchor frames together with temporal queries.
+    downsample_anchor_frames: bool = False
+    # Optional list of episode file paths to exclude at training time.
+    # Paths may be relative to the dataset root or absolute; matching is normalized in the data loader.
+    excluded_episode_paths: Sequence[str] = ()
+    # CLI overrides; None preserves the selected config's base settings.
+    lerobot_video_backend: Literal["pyav", "torchcodec", "video_reader"] | None = None
+    lerobot_table_query_mode: Literal["legacy", "grouped"] | None = None
     # Determines how the assets will be loaded.
     assets: AssetsConfig = dataclasses.field(default_factory=AssetsConfig)
     # Base config that will be updated by the factory.
@@ -191,10 +208,18 @@ class DataConfigFactory(abc.ABC):
     def create_base_config(self, assets_dirs: pathlib.Path, model_config: _model.BaseModelConfig) -> DataConfig:
         repo_id = self.repo_id if self.repo_id is not tyro.MISSING else None
         asset_id = self.assets.asset_id or _default_asset_id(repo_id)
+        excluded_episode_paths = self.excluded_episode_paths
+        if self.base_config is not None and self.base_config.excluded_episode_paths:
+            excluded_episode_paths = self.base_config.excluded_episode_paths
+        base = self.base_config or DataConfig()
         return dataclasses.replace(
-            self.base_config or DataConfig(),
+            base,
+            lerobot_video_backend=self.lerobot_video_backend or base.lerobot_video_backend,
+            lerobot_table_query_mode=self.lerobot_table_query_mode or base.lerobot_table_query_mode,
             repo_id=repo_id,
             asset_id=asset_id,
+            downsample_anchor_frames=self.downsample_anchor_frames,
+            excluded_episode_paths=excluded_episode_paths,
             norm_stats=self._load_norm_stats(epath.Path(self.assets.assets_dir or assets_dirs), asset_id),
             use_quantile_norm=model_config.model_type != ModelType.PI0,
         )
@@ -1450,6 +1475,486 @@ _CONFIGS = [
         model=pi0_config.Pi0Config(pi05=True, action_horizon=64, action_dim=32, discrete_state_input=False),
         data=LeRobotUmiOriginalDualArmRelativeStateDataConfig(
             repo_id="/groups/gag51454/workspace_makihara/dataset/assem/lerobot_v21_ph2_success_200",
+            base_config=DataConfig(prompt_from_task=True, lerobot_tolerance_s=0.05),
+            downsample_step=1,
+            history_steps=4,
+            action_horizon_steps=64,
+            action_pose_target="relative",
+        ),
+        batch_size=32,
+        lr_schedule=_optimizer.CosineDecaySchedule(
+            warmup_steps=10_000,
+            peak_lr=5e-5,
+            decay_steps=1_000_000,
+            decay_lr=5e-5,
+        ),
+        optimizer=_optimizer.AdamW(clip_gradient_norm=1.0),
+        ema_decay=0.999,
+        weight_loader=weight_loaders.CheckpointWeightLoader("gs://openpi-assets/checkpoints/pi05_base/params"),
+        pytorch_weight_path="/path/to/your/pytorch_weight_path",
+        num_train_steps=30_000,
+    ),
+    TrainConfig(
+        name="pi05_umi_original_dual_arm_relative_state_hz30_h32_bs32_30k_assemblyecu_single_v2",
+        model=pi0_config.Pi0Config(pi05=True, action_horizon=32, action_dim=32, discrete_state_input=False),
+        data=LeRobotUmiOriginalDualArmRelativeStateDataConfig(
+            repo_id="/fsx/koshi.makihara/datasets_tasked/lerobot_v21_ph2_success_all_tasked_single_v2",
+            base_config=DataConfig(prompt_from_task=True, lerobot_tolerance_s=0.05),
+            downsample_step=2,
+            history_steps=4,
+            action_horizon_steps=32,
+            action_pose_target="relative",
+        ),
+        batch_size=32,
+        lr_schedule=_optimizer.CosineDecaySchedule(
+            warmup_steps=10_000,
+            peak_lr=5e-5,
+            decay_steps=1_000_000,
+            decay_lr=5e-5,
+        ),
+        optimizer=_optimizer.AdamW(clip_gradient_norm=1.0),
+        ema_decay=0.999,
+        weight_loader=weight_loaders.CheckpointWeightLoader("gs://openpi-assets/checkpoints/pi05_base/params"),
+        pytorch_weight_path="/path/to/your/pytorch_weight_path",
+        num_train_steps=30_000,
+    ),
+    TrainConfig(
+        name="pi05_umi_original_dual_arm_relative_state_hz60_h64_bs32_30k_assemblyecu_single_v2",
+        model=pi0_config.Pi0Config(pi05=True, action_horizon=64, action_dim=32, discrete_state_input=False),
+        data=LeRobotUmiOriginalDualArmRelativeStateDataConfig(
+            repo_id="/fsx/koshi.makihara/datasets_tasked/lerobot_v21_ph2_success_all_tasked_single_v2",
+            base_config=DataConfig(prompt_from_task=True, lerobot_tolerance_s=0.05),
+            downsample_step=1,
+            history_steps=4,
+            action_horizon_steps=64,
+            action_pose_target="relative",
+        ),
+        batch_size=32,
+        lr_schedule=_optimizer.CosineDecaySchedule(
+            warmup_steps=10_000,
+            peak_lr=5e-5,
+            decay_steps=1_000_000,
+            decay_lr=5e-5,
+        ),
+        optimizer=_optimizer.AdamW(clip_gradient_norm=1.0),
+        ema_decay=0.999,
+        weight_loader=weight_loaders.CheckpointWeightLoader("gs://openpi-assets/checkpoints/pi05_base/params"),
+        pytorch_weight_path="/path/to/your/pytorch_weight_path",
+        num_train_steps=30_000,
+    ),
+    TrainConfig(
+        name="pi05_umi_original_dual_arm_relative_state_hz30_h32_bs32_30k_assemblyecu_singleinst_v2",
+        model=pi0_config.Pi0Config(pi05=True, action_horizon=32, action_dim=32, discrete_state_input=False),
+        data=LeRobotUmiOriginalDualArmRelativeStateDataConfig(
+            repo_id="/fsx/koshi.makihara/datasets_tasked/lerobot_v21_ph2_success_all_tasked_singleinst_v2",
+            base_config=DataConfig(prompt_from_task=True, lerobot_tolerance_s=0.05),
+            downsample_step=2,
+            history_steps=4,
+            action_horizon_steps=32,
+            action_pose_target="relative",
+        ),
+        batch_size=32,
+        lr_schedule=_optimizer.CosineDecaySchedule(
+            warmup_steps=10_000,
+            peak_lr=5e-5,
+            decay_steps=1_000_000,
+            decay_lr=5e-5,
+        ),
+        optimizer=_optimizer.AdamW(clip_gradient_norm=1.0),
+        ema_decay=0.999,
+        weight_loader=weight_loaders.CheckpointWeightLoader("gs://openpi-assets/checkpoints/pi05_base/params"),
+        pytorch_weight_path="/path/to/your/pytorch_weight_path",
+        num_train_steps=30_000,
+    ),
+    TrainConfig(
+        name="pi05_umi_original_dual_arm_relative_state_hz30_h32_bs32_30k_PickAndPlace_merged_gripper",
+        model=pi0_config.Pi0Config(pi05=True, action_horizon=32, action_dim=32, discrete_state_input=False),
+        data=LeRobotUmiOriginalDualArmRelativeStateDataConfig(
+            repo_id="/fsx/koshi.makihara/datasets_tasked/lerobot_v21_ph2_PickAndPlace_merged_gripper",
+            base_config=DataConfig(prompt_from_task=True, lerobot_tolerance_s=0.05),
+            downsample_step=2,
+            history_steps=4,
+            action_horizon_steps=32,
+            action_pose_target="relative",
+        ),
+        batch_size=32,
+        num_workers=8,
+        lr_schedule=_optimizer.CosineDecaySchedule(
+            warmup_steps=10_000,
+            peak_lr=5e-5,
+            decay_steps=1_000_000,
+            decay_lr=5e-5,
+        ),
+        optimizer=_optimizer.AdamW(clip_gradient_norm=1.0),
+        ema_decay=0.999,
+        weight_loader=weight_loaders.CheckpointWeightLoader("gs://openpi-assets/checkpoints/pi05_base/params"),
+        pytorch_weight_path="/path/to/your/pytorch_weight_path",
+        num_train_steps=100000,
+        wandb_enabled=False,
+    ),
+    TrainConfig(
+        name="pi05_umi_original_dual_arm_relative_state_hz30_h32_bs256_100k_PickAndPlace_merged_gripper",
+        model=pi0_config.Pi0Config(pi05=True, action_horizon=32, action_dim=32, discrete_state_input=False),
+        data=LeRobotUmiOriginalDualArmRelativeStateDataConfig(
+            repo_id="/fsx/koshi.makihara/datasets_tasked/lerobot_v21_ph2_PickAndPlace_merged_gripper",
+            base_config=DataConfig(prompt_from_task=True, lerobot_tolerance_s=0.05),
+            downsample_step=2,
+            history_steps=4,
+            action_horizon_steps=32,
+            action_pose_target="relative",
+        ),
+        batch_size=256,
+        num_workers=16,
+        lr_schedule=_optimizer.CosineDecaySchedule(
+            warmup_steps=10_000,
+            peak_lr=5e-5,
+            decay_steps=1_000_000,
+            decay_lr=5e-5,
+        ),
+        optimizer=_optimizer.AdamW(clip_gradient_norm=1.0),
+        ema_decay=0.999,
+        weight_loader=weight_loaders.CheckpointWeightLoader("gs://openpi-assets/checkpoints/pi05_base/params"),
+        pytorch_weight_path="/path/to/your/pytorch_weight_path",
+        num_train_steps=100000,
+        wandb_enabled=False,
+    ),
+    TrainConfig(
+        name="pi05_umi_original_dual_arm_relative_state_hz10_h50_bs512_100k_PickAndPlace_merged_gripper",
+        model=pi0_config.Pi0Config(pi05=True, action_horizon=50, action_dim=32, discrete_state_input=False),
+        data=LeRobotUmiOriginalDualArmRelativeStateDataConfig(
+            repo_id="/fsx/koshi.makihara/datasets_tasked/lerobot_v21_ph2_PickAndPlace_merged_gripper",
+            base_config=DataConfig(prompt_from_task=True, lerobot_tolerance_s=0.05),
+            downsample_step=6,
+            history_steps=4,
+            action_horizon_steps=50,
+            action_pose_target="relative",
+        ),
+        batch_size=512,
+        num_workers=64,
+        lr_schedule=_optimizer.CosineDecaySchedule(
+            warmup_steps=10_000,
+            peak_lr=5e-5,
+            decay_steps=1_000_000,
+            decay_lr=5e-5,
+        ),
+        optimizer=_optimizer.AdamW(clip_gradient_norm=1.0),
+        ema_decay=0.999,
+        weight_loader=weight_loaders.CheckpointWeightLoader("gs://openpi-assets/checkpoints/pi05_base/params"),
+        pytorch_weight_path="/path/to/your/pytorch_weight_path",
+        num_train_steps=100000,
+        wandb_enabled=False,
+    ),
+    TrainConfig(
+        name="pi05_umi_original_dual_arm_relative_state_hz10_h50_bs512_100k_PickAndPlace_merged_gripper_224",
+        model=pi0_config.Pi0Config(pi05=True, action_horizon=50, action_dim=32, discrete_state_input=False),
+        data=LeRobotUmiOriginalDualArmRelativeStateDataConfig(
+            repo_id="/fsx/koshi.makihara/datasets_tasked/lerobot_v21_ph2_PickAndPlace_merged_gripper_224",
+            base_config=DataConfig(prompt_from_task=True, lerobot_tolerance_s=0.05),
+            downsample_step=6,
+            history_steps=4,
+            action_horizon_steps=50,
+            action_pose_target="relative",
+        ),
+        batch_size=512,
+        num_workers=32,
+        lr_schedule=_optimizer.CosineDecaySchedule(
+            warmup_steps=10_000,
+            peak_lr=5e-5,
+            decay_steps=1_000_000,
+            decay_lr=5e-5,
+        ),
+        optimizer=_optimizer.AdamW(clip_gradient_norm=1.0),
+        ema_decay=0.999,
+        weight_loader=weight_loaders.CheckpointWeightLoader("gs://openpi-assets/checkpoints/pi05_base/params"),
+        pytorch_weight_path="/path/to/your/pytorch_weight_path",
+        num_train_steps=100000,
+        wandb_enabled=False,
+    ),
+    TrainConfig(
+        name="pi05_umi_original_dual_arm_relative_state_hz10_h50_bs512_100k_PickAndPlace_merged_gripper_224_train_mm_f30_s300_trim1s2s",
+        model=pi0_config.Pi0Config(pi05=True, action_horizon=50, action_dim=32, discrete_state_input=False),
+        data=LeRobotUmiOriginalDualArmRelativeStateDataConfig(
+            repo_id="/fsx/koshi.makihara/datasets_tasked/lerobot_v21_ph2_PickAndPlace_merged_gripper_224_train_mm_f30_s300_trim1s2s",
+            base_config=DataConfig(prompt_from_task=True, lerobot_tolerance_s=0.05),
+            downsample_step=6,
+            history_steps=4,
+            action_horizon_steps=50,
+            action_pose_target="relative",
+        ),
+        batch_size=512,
+        num_workers=32,
+        lr_schedule=_optimizer.CosineDecaySchedule(
+            warmup_steps=10_000,
+            peak_lr=5e-5,
+            decay_steps=1_000_000,
+            decay_lr=5e-5,
+        ),
+        optimizer=_optimizer.AdamW(clip_gradient_norm=1.0),
+        ema_decay=0.999,
+        weight_loader=weight_loaders.CheckpointWeightLoader("gs://openpi-assets/checkpoints/pi05_base/params"),
+        pytorch_weight_path="/path/to/your/pytorch_weight_path",
+        num_train_steps=100000,
+        wandb_enabled=False,
+    ),
+    TrainConfig(
+        name="pi05_umi_original_dual_arm_relative_state_hz30_h50_bs512_100k_PickAndPlace_merged_gripper_224",
+        model=pi0_config.Pi0Config(pi05=True, action_horizon=50, action_dim=32, discrete_state_input=False),
+        data=LeRobotUmiOriginalDualArmRelativeStateDataConfig(
+            repo_id="/fsx/koshi.makihara/datasets_tasked/lerobot_v21_ph2_PickAndPlace_merged_gripper_224",
+            base_config=DataConfig(prompt_from_task=True, lerobot_tolerance_s=0.05),
+            downsample_step=2,
+            history_steps=4,
+            action_horizon_steps=50,
+            action_pose_target="relative",
+        ),
+        batch_size=512,
+        num_workers=32,
+        lr_schedule=_optimizer.CosineDecaySchedule(
+            warmup_steps=10_000,
+            peak_lr=5e-5,
+            decay_steps=1_000_000,
+            decay_lr=5e-5,
+        ),
+        optimizer=_optimizer.AdamW(clip_gradient_norm=1.0),
+        ema_decay=0.999,
+        weight_loader=weight_loaders.CheckpointWeightLoader("gs://openpi-assets/checkpoints/pi05_base/params"),
+        pytorch_weight_path="/path/to/your/pytorch_weight_path",
+        num_train_steps=100000,
+        wandb_enabled=False,
+    ),
+    TrainConfig(
+        name="pi05_umi_original_dual_arm_relative_state_hz30_h32_bs1024_30k_assemblyecu_20260915",
+        model=pi0_config.Pi0Config(pi05=True, action_horizon=32, action_dim=32, discrete_state_input=False),
+        data=LeRobotUmiOriginalDualArmRelativeStateDataConfig(
+            repo_id="/fsx/koshi.makihara/datasets/lerobot_v21_ph2_success_20260915_fixed",
+            base_config=DataConfig(prompt_from_task=True, lerobot_tolerance_s=0.05),
+            downsample_step=2,
+            history_steps=4,
+            action_horizon_steps=32,
+            action_pose_target="relative",
+        ),
+        batch_size=1024,
+        lr_schedule=_optimizer.CosineDecaySchedule(
+            warmup_steps=10_000,
+            peak_lr=5e-5,
+            decay_steps=1_000_000,
+            decay_lr=5e-5,
+        ),
+        optimizer=_optimizer.AdamW(clip_gradient_norm=1.0),
+        ema_decay=0.999,
+        weight_loader=weight_loaders.CheckpointWeightLoader("gs://openpi-assets/checkpoints/pi05_base/params"),
+        pytorch_weight_path="/path/to/your/pytorch_weight_path",
+        num_train_steps=30_000,
+        wandb_enabled=False,
+    ),
+    TrainConfig(
+        name="pi05_umi_original_dual_arm_relative_state_hz30_h32_bs32_30k_assemblyecu_20260915_merged",
+        model=pi0_config.Pi0Config(pi05=True, action_horizon=32, action_dim=32, discrete_state_input=False),
+        data=LeRobotUmiOriginalDualArmRelativeStateDataConfig(
+            repo_id="/fsx/koshi.makihara/datasets_tasked/lerobot_v21_ph2_success_20260915_merged_fixed",
+            base_config=DataConfig(prompt_from_task=True, lerobot_tolerance_s=0.05),
+            downsample_step=2,
+            history_steps=4,
+            action_horizon_steps=32,
+            action_pose_target="relative",
+        ),
+        batch_size=32,
+        lr_schedule=_optimizer.CosineDecaySchedule(
+            warmup_steps=10_000,
+            peak_lr=5e-5,
+            decay_steps=1_000_000,
+            decay_lr=5e-5,
+        ),
+        optimizer=_optimizer.AdamW(clip_gradient_norm=1.0),
+        ema_decay=0.999,
+        weight_loader=weight_loaders.CheckpointWeightLoader("gs://openpi-assets/checkpoints/pi05_base/params"),
+        pytorch_weight_path="/path/to/your/pytorch_weight_path",
+        num_train_steps=30_000,
+        wandb_enabled=False,
+    ),
+    TrainConfig(
+        name="pi05_umi_original_dual_arm_relative_state_hz30_h32_bs256_30k_assemblyecu_all_tasked_20260917_20260918_merged",
+        model=pi0_config.Pi0Config(pi05=True, action_horizon=32, action_dim=32, discrete_state_input=False),
+        data=LeRobotUmiOriginalDualArmRelativeStateDataConfig(
+            repo_id="/fsx/koshi.makihara/datasets_tasked/lerobot_v21_ph2_success_all_tasked_20260917_20260918_merged",
+            base_config=DataConfig(prompt_from_task=True, lerobot_tolerance_s=0.05),
+            downsample_step=2,
+            history_steps=4,
+            action_horizon_steps=32,
+            action_pose_target="relative",
+        ),
+        batch_size=256,
+        num_workers=16,
+        lr_schedule=_optimizer.CosineDecaySchedule(
+            warmup_steps=10_000,
+            peak_lr=5e-5,
+            decay_steps=1_000_000,
+            decay_lr=5e-5,
+        ),
+        optimizer=_optimizer.AdamW(clip_gradient_norm=1.0),
+        ema_decay=0.999,
+        weight_loader=weight_loaders.CheckpointWeightLoader("gs://openpi-assets/checkpoints/pi05_base/params"),
+        pytorch_weight_path="/path/to/your/pytorch_weight_path",
+        num_train_steps=30_000,
+        wandb_enabled=False,
+    ),
+    TrainConfig(
+        name="pi05_umi_original_dual_arm_relative_state_hz30_h32_bs256_30k_assemblyecu_all_tasked_20260917_20260918_20261002_merged",
+        model=pi0_config.Pi0Config(pi05=True, action_horizon=32, action_dim=32, discrete_state_input=False),
+        data=LeRobotUmiOriginalDualArmRelativeStateDataConfig(
+            repo_id="/fsx/koshi.makihara/datasets_tasked/lerobot_v21_ph2_success_all_tasked_20260917_20260918_20261002_merged_fixed",
+            base_config=DataConfig(prompt_from_task=True, lerobot_tolerance_s=0.05),
+            downsample_step=2,
+            history_steps=4,
+            action_horizon_steps=32,
+            action_pose_target="relative",
+        ),
+        batch_size=256,
+        num_workers=16,
+        lr_schedule=_optimizer.CosineDecaySchedule(
+            warmup_steps=10_000,
+            peak_lr=5e-5,
+            decay_steps=1_000_000,
+            decay_lr=5e-5,
+        ),
+        optimizer=_optimizer.AdamW(clip_gradient_norm=1.0),
+        ema_decay=0.999,
+        weight_loader=weight_loaders.CheckpointWeightLoader("gs://openpi-assets/checkpoints/pi05_base/params"),
+        pytorch_weight_path="/path/to/your/pytorch_weight_path",
+        num_train_steps=30_000,
+        wandb_enabled=False,
+    ),
+    TrainConfig(
+        name="pi05_umi_original_dual_arm_relative_state_hz30_h32_bs512_100k_assemblyecu_all_tasked_20260917_20260918_20261002_merged",
+        model=pi0_config.Pi0Config(pi05=True, action_horizon=32, action_dim=32, discrete_state_input=False),
+        data=LeRobotUmiOriginalDualArmRelativeStateDataConfig(
+            repo_id="/fsx/koshi.makihara/datasets_tasked/lerobot_v21_ph2_success_all_tasked_20260917_20260918_20261002_merged_fixed",
+            base_config=DataConfig(prompt_from_task=True, lerobot_tolerance_s=0.05),
+            downsample_step=2,
+            history_steps=4,
+            action_horizon_steps=32,
+            action_pose_target="relative",
+        ),
+        batch_size=512,
+        num_workers=32,
+        lr_schedule=_optimizer.CosineDecaySchedule(
+            warmup_steps=10_000,
+            peak_lr=5e-5,
+            decay_steps=1_000_000,
+            decay_lr=5e-5,
+        ),
+        optimizer=_optimizer.AdamW(clip_gradient_norm=1.0),
+        ema_decay=0.999,
+        weight_loader=weight_loaders.CheckpointWeightLoader("gs://openpi-assets/checkpoints/pi05_base/params"),
+        pytorch_weight_path="/path/to/your/pytorch_weight_path",
+        num_train_steps=100_000,
+        wandb_enabled=False,
+    ),
+    TrainConfig(
+        name="pi05_umi_original_dual_arm_relative_state_hz30_h32_bs512_10k_assemblyecu_20261008",
+        model=pi0_config.Pi0Config(pi05=True, action_horizon=32, action_dim=32, discrete_state_input=False),
+        data=LeRobotUmiOriginalDualArmRelativeStateDataConfig(
+            repo_id="/fsx/koshi.makihara/datasets_tasked/lerobot_v21_ph2_success_20261008_AssemblyECU",
+            base_config=DataConfig(prompt_from_task=True, lerobot_tolerance_s=0.05),
+            downsample_step=2,
+            history_steps=4,
+            action_horizon_steps=32,
+            action_pose_target="relative",
+        ),
+        batch_size=512,
+        num_workers=32,
+        lr_schedule=_optimizer.CosineDecaySchedule(
+            warmup_steps=10_000,
+            peak_lr=5e-5,
+            decay_steps=1_000_000,
+            decay_lr=5e-5,
+        ),
+        optimizer=_optimizer.AdamW(clip_gradient_norm=1.0),
+        ema_decay=0.999,
+        weight_loader=weight_loaders.CheckpointWeightLoader("gs://openpi-assets/checkpoints/pi05_base/params"),
+        pytorch_weight_path="/path/to/your/pytorch_weight_path",
+        num_train_steps=10_000,
+        wandb_enabled=False,
+    ),
+    TrainConfig(
+        name="pi05_umi_original_dual_arm_relative_state_hz30_h32_bs512_100k_assemblyecu_20261008",
+        model=pi0_config.Pi0Config(pi05=True, action_horizon=32, action_dim=32, discrete_state_input=False),
+        data=LeRobotUmiOriginalDualArmRelativeStateDataConfig(
+            repo_id="/fsx/koshi.makihara/datasets_tasked/lerobot_v21_ph2_success_20261008_AssemblyECU",
+            base_config=DataConfig(prompt_from_task=True, lerobot_tolerance_s=0.05),
+            downsample_step=2,
+            history_steps=4,
+            action_horizon_steps=32,
+            action_pose_target="relative",
+        ),
+        batch_size=512,
+        num_workers=32,
+        lr_schedule=_optimizer.CosineDecaySchedule(
+            warmup_steps=10_000,
+            peak_lr=5e-5,
+            decay_steps=1_000_000,
+            decay_lr=5e-5,
+        ),
+        optimizer=_optimizer.AdamW(clip_gradient_norm=1.0),
+        ema_decay=0.999,
+        weight_loader=weight_loaders.CheckpointWeightLoader("gs://openpi-assets/checkpoints/pi05_base/params"),
+        pytorch_weight_path="/path/to/your/pytorch_weight_path",
+        num_train_steps=100_000,
+        wandb_enabled=False,
+    ),
+    TrainConfig(
+        name="pi05_umi_original_dual_arm_relative_state_hz60_h64_bs32_30k_assemblyecu_singleinst_v2",
+        model=pi0_config.Pi0Config(pi05=True, action_horizon=64, action_dim=32, discrete_state_input=False),
+        data=LeRobotUmiOriginalDualArmRelativeStateDataConfig(
+            repo_id="/fsx/koshi.makihara/datasets_tasked/lerobot_v21_ph2_success_all_tasked_singleinst_v2",
+            base_config=DataConfig(prompt_from_task=True, lerobot_tolerance_s=0.05),
+            downsample_step=1,
+            history_steps=4,
+            action_horizon_steps=64,
+            action_pose_target="relative",
+        ),
+        batch_size=32,
+        lr_schedule=_optimizer.CosineDecaySchedule(
+            warmup_steps=10_000,
+            peak_lr=5e-5,
+            decay_steps=1_000_000,
+            decay_lr=5e-5,
+        ),
+        optimizer=_optimizer.AdamW(clip_gradient_norm=1.0),
+        ema_decay=0.999,
+        weight_loader=weight_loaders.CheckpointWeightLoader("gs://openpi-assets/checkpoints/pi05_base/params"),
+        pytorch_weight_path="/path/to/your/pytorch_weight_path",
+        num_train_steps=30_000,
+    ),
+    TrainConfig(
+        name="pi05_umi_original_dual_arm_relative_state_hz30_h32_bs32_30k_assemblyecu_multi_v2",
+        model=pi0_config.Pi0Config(pi05=True, action_horizon=32, action_dim=32, discrete_state_input=False),
+        data=LeRobotUmiOriginalDualArmRelativeStateDataConfig(
+            repo_id="/fsx/koshi.makihara/datasets_tasked/lerobot_v21_ph2_success_all_tasked_multi_v2",
+            base_config=DataConfig(prompt_from_task=True, lerobot_tolerance_s=0.05),
+            downsample_step=2,
+            history_steps=4,
+            action_horizon_steps=32,
+            action_pose_target="relative",
+        ),
+        batch_size=32,
+        lr_schedule=_optimizer.CosineDecaySchedule(
+            warmup_steps=10_000,
+            peak_lr=5e-5,
+            decay_steps=1_000_000,
+            decay_lr=5e-5,
+        ),
+        optimizer=_optimizer.AdamW(clip_gradient_norm=1.0),
+        ema_decay=0.999,
+        weight_loader=weight_loaders.CheckpointWeightLoader("gs://openpi-assets/checkpoints/pi05_base/params"),
+        pytorch_weight_path="/path/to/your/pytorch_weight_path",
+        num_train_steps=30_000,
+    ),
+    TrainConfig(
+        name="pi05_umi_original_dual_arm_relative_state_hz60_h64_bs32_30k_assemblyecu_multi_v2",
+        model=pi0_config.Pi0Config(pi05=True, action_horizon=64, action_dim=32, discrete_state_input=False),
+        data=LeRobotUmiOriginalDualArmRelativeStateDataConfig(
+            repo_id="/fsx/koshi.makihara/datasets_tasked/lerobot_v21_ph2_success_all_tasked_multi_v2",
             base_config=DataConfig(prompt_from_task=True, lerobot_tolerance_s=0.05),
             downsample_step=1,
             history_steps=4,

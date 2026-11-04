@@ -91,14 +91,37 @@ def _delta_pose9d_seq_from_absolute(current_pose7: np.ndarray, future_pose_seq_a
     return np.asarray(deltas, dtype=np.float32)
 
 
+_GRIPPER_WRAP_THRESHOLD = 3.0
+_GRIPPER_WRAP_OFFSET = 2.0 * np.pi
+_GRIPPER_MAX_TARGET = 6.28
+_GRIPPER_MIN_TARGET = 5.41
+
+
 def _forward_fill_zeros(x: np.ndarray, eps: float = 1e-8) -> np.ndarray:
+    """Fill dropouts, unwrap low values, and align a sequence to target bounds."""
     x = np.asarray(x, dtype=np.float32).reshape(-1).copy()
-    last = 0.0
-    for i in range(x.shape[0]):
-        if abs(float(x[i])) <= eps:
-            x[i] = last
-        else:
-            last = float(x[i])
+
+    valid = np.isfinite(x) & (np.abs(x) > eps)
+    if np.any(valid):
+        last = float(x[np.flatnonzero(valid)[0]])
+        for i in range(x.shape[0]):
+            if not np.isfinite(x[i]) or abs(float(x[i])) <= eps:
+                x[i] = last
+            else:
+                last = float(x[i])
+
+    low_wrapped = np.isfinite(x) & (x >= 0.0) & (x <= _GRIPPER_WRAP_THRESHOLD)
+    x[low_wrapped] += _GRIPPER_WRAP_OFFSET
+
+    finite = np.isfinite(x)
+    if np.any(finite):
+        max_excess = float(np.max(x[finite])) - _GRIPPER_MAX_TARGET
+        if max_excess > 0.0:
+            x[finite] -= max_excess
+
+        min_shortfall = _GRIPPER_MIN_TARGET - float(np.min(x[finite]))
+        if min_shortfall > 0.0:
+            x[finite] += min_shortfall
     return x
 
 
@@ -118,7 +141,7 @@ def _select_action_target(
     action_pose_target: Literal["delta", "relative"],
 ) -> tuple[np.ndarray, dict[str, np.ndarray]]:
     future_pose_seq_abs = np.asarray(future_pose_seq_abs[:action_len], dtype=np.float32)
-    future_gripper_abs = _forward_fill_zeros(future_gripper_seq_abs[:action_len])[:, None]
+    future_gripper_abs = np.asarray(future_gripper_seq_abs[:action_len], dtype=np.float32)[:, None]
 
     delta_pose9d = _delta_pose9d_seq_from_absolute(current_pose, future_pose_seq_abs)
     delta_actions = np.concatenate([delta_pose9d, future_gripper_abs], axis=-1)
@@ -144,6 +167,7 @@ class UmiOriginalInputs(transforms.DataTransformFn):
     history_steps: int = 4
     action_horizon_steps: int = 10
     action_pose_target: Literal["delta", "relative"] = "delta"
+    gripper_preprocessed: bool = False
 
     def __call__(self, data: dict) -> dict:
         right_image = _parse_image(data["right_image"])
@@ -157,6 +181,8 @@ class UmiOriginalInputs(transforms.DataTransformFn):
             self.history_steps + self.action_horizon_steps,
             "gripper_seq",
         )
+        if not self.gripper_preprocessed:
+            gripper_seq = _forward_fill_zeros(gripper_seq)
 
         hist_len = self.history_steps
         action_len = self.action_horizon_steps
@@ -166,7 +192,7 @@ class UmiOriginalInputs(transforms.DataTransformFn):
         future_gripper_seq_abs = gripper_seq[hist_len : hist_len + action_len]
 
         hist_rel = np.asarray([_relative_pose9d(current_pose, pose) for pose in hist_pose_seq], dtype=np.float32)
-        gripper_hist = _forward_fill_zeros(gripper_seq[:hist_len])[:, None]
+        gripper_hist = gripper_seq[:hist_len, None]
         state = np.concatenate([hist_rel, gripper_hist], axis=-1).reshape(-1)
 
         inputs = {
@@ -213,6 +239,7 @@ class UmiOriginalRightThirdSlotInputs(transforms.DataTransformFn):
     history_steps: int = 4
     action_horizon_steps: int = 10
     action_pose_target: Literal["delta", "relative"] = "delta"
+    gripper_preprocessed: bool = False
 
     def __call__(self, data: dict) -> dict:
         right_image = _parse_image(data["right_image"])
@@ -226,6 +253,8 @@ class UmiOriginalRightThirdSlotInputs(transforms.DataTransformFn):
             self.history_steps + self.action_horizon_steps,
             "gripper_seq",
         )
+        if not self.gripper_preprocessed:
+            gripper_seq = _forward_fill_zeros(gripper_seq)
 
         hist_len = self.history_steps
         action_len = self.action_horizon_steps
@@ -235,7 +264,7 @@ class UmiOriginalRightThirdSlotInputs(transforms.DataTransformFn):
         future_gripper_seq_abs = gripper_seq[hist_len : hist_len + action_len]
 
         hist_rel = np.asarray([_relative_pose9d(current_pose, pose) for pose in hist_pose_seq], dtype=np.float32)
-        gripper_hist = _forward_fill_zeros(gripper_seq[:hist_len])[:, None]
+        gripper_hist = gripper_seq[:hist_len, None]
         state = np.concatenate([hist_rel, gripper_hist], axis=-1).reshape(-1)
 
         inputs = {
@@ -276,6 +305,7 @@ class UmiOriginalRightPrevAndCurrentThirdSlotInputs(transforms.DataTransformFn):
     history_steps: int = 4
     action_horizon_steps: int = 10
     action_pose_target: Literal["delta", "relative"] = "delta"
+    gripper_preprocessed: bool = False
 
     def __call__(self, data: dict) -> dict:
         right_image_seq = _parse_image_sequence(data["right_image"])
@@ -292,6 +322,8 @@ class UmiOriginalRightPrevAndCurrentThirdSlotInputs(transforms.DataTransformFn):
             self.history_steps + self.action_horizon_steps,
             "gripper_seq",
         )
+        if not self.gripper_preprocessed:
+            gripper_seq = _forward_fill_zeros(gripper_seq)
 
         hist_len = self.history_steps
         action_len = self.action_horizon_steps
@@ -301,7 +333,7 @@ class UmiOriginalRightPrevAndCurrentThirdSlotInputs(transforms.DataTransformFn):
         future_gripper_seq_abs = gripper_seq[hist_len : hist_len + action_len]
 
         hist_rel = np.asarray([_relative_pose9d(current_pose, pose) for pose in hist_pose_seq], dtype=np.float32)
-        gripper_hist = _forward_fill_zeros(gripper_seq[:hist_len])[:, None]
+        gripper_hist = gripper_seq[:hist_len, None]
         state = np.concatenate([hist_rel, gripper_hist], axis=-1).reshape(-1)
 
         inputs = {
@@ -342,6 +374,7 @@ class UmiOriginalBimanualInputs(transforms.DataTransformFn):
     history_steps: int = 4
     action_horizon_steps: int = 10
     action_pose_target: Literal["delta", "relative"] = "delta"
+    gripper_preprocessed: bool = False
 
     def __call__(self, data: dict) -> dict:
         left_image = _parse_image(data["left_image"])
@@ -367,6 +400,9 @@ class UmiOriginalBimanualInputs(transforms.DataTransformFn):
             self.history_steps + self.action_horizon_steps,
             "right_gripper_seq",
         )
+        if not self.gripper_preprocessed:
+            left_gripper_seq = _forward_fill_zeros(left_gripper_seq)
+            right_gripper_seq = _forward_fill_zeros(right_gripper_seq)
 
         hist_len = self.history_steps
         action_len = self.action_horizon_steps
@@ -386,8 +422,8 @@ class UmiOriginalBimanualInputs(transforms.DataTransformFn):
         right_hist_rel = np.asarray(
             [_relative_pose9d(right_current_pose, pose) for pose in right_hist_pose_seq], dtype=np.float32
         )
-        left_gripper_hist = _forward_fill_zeros(left_gripper_seq[:hist_len])[:, None]
-        right_gripper_hist = _forward_fill_zeros(right_gripper_seq[:hist_len])[:, None]
+        left_gripper_hist = left_gripper_seq[:hist_len, None]
+        right_gripper_hist = right_gripper_seq[:hist_len, None]
         left_state_seq = np.concatenate([left_hist_rel, left_gripper_hist], axis=-1)
         right_state_seq = np.concatenate([right_hist_rel, right_gripper_hist], axis=-1)
         state = np.concatenate([left_state_seq, right_state_seq], axis=-1).reshape(-1)
@@ -447,6 +483,7 @@ class UmiOriginalDualArmRelativeStateInputs(transforms.DataTransformFn):
     history_steps: int = 4
     action_horizon_steps: int = 10
     action_pose_target: Literal["delta", "relative"] = "delta"
+    gripper_preprocessed: bool = False
 
     def __call__(self, data: dict) -> dict:
         left_image = _parse_image(data["left_image"])
@@ -472,6 +509,9 @@ class UmiOriginalDualArmRelativeStateInputs(transforms.DataTransformFn):
             self.history_steps + self.action_horizon_steps,
             "right_gripper_seq",
         )
+        if not self.gripper_preprocessed:
+            left_gripper_seq = _forward_fill_zeros(left_gripper_seq)
+            right_gripper_seq = _forward_fill_zeros(right_gripper_seq)
 
         hist_len = self.history_steps
         action_len = self.action_horizon_steps
@@ -491,8 +531,8 @@ class UmiOriginalDualArmRelativeStateInputs(transforms.DataTransformFn):
         right_hist_rel = np.asarray(
             [_relative_pose9d(right_current_pose, pose) for pose in right_hist_pose_seq], dtype=np.float32
         )
-        left_gripper_hist = _forward_fill_zeros(left_gripper_seq[:hist_len])[:, None]
-        right_gripper_hist = _forward_fill_zeros(right_gripper_seq[:hist_len])[:, None]
+        left_gripper_hist = left_gripper_seq[:hist_len, None]
+        right_gripper_hist = right_gripper_seq[:hist_len, None]
         left_state_seq = np.concatenate([left_hist_rel, left_gripper_hist], axis=-1)
         right_state_seq = np.concatenate([right_hist_rel, right_gripper_hist], axis=-1)
         left_wrt_right = _relative_pose9d(right_current_pose, left_current_pose)
